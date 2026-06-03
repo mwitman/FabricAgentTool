@@ -8,12 +8,16 @@ import {
 import { InteractionRequiredAuthError } from "@azure/msal-browser";
 import Sidebar from "./components/Sidebar";
 import ChatPanel from "./components/ChatPanel";
+import type { Message } from "./components/ChatMessage";
 import { loginRequest, fabricTokenRequest, powerBiTokenRequest } from "./authConfig";
 
 export interface Conversation {
   id: string;
   name: string;
   createdAt: number;
+  updatedAt?: number;
+  agent: string;
+  messages: Message[];
 }
 
 export interface AgentOption {
@@ -32,12 +36,31 @@ export default function App() {
   const [agentOptions, setAgentOptions] = useState<AgentOption[]>([]);
   const [selectedAgent, setSelectedAgent] = useState("");
   const [loadingAgents, setLoadingAgents] = useState(true);
+  const [loadingConversations, setLoadingConversations] = useState(true);
+  const conversationsLoadedRef = React.useRef(false);
+  const skipNextConversationSaveRef = React.useRef(false);
 
   const account = accounts[0] ?? null;
-  const selectedAgentOption = useMemo(
-    () => agentOptions.find((agent) => agent.key === selectedAgent) ?? agentOptions[0],
+  const selectedAgentOption = useMemo<AgentOption>(
+    () => agentOptions.find((agent) => agent.key === selectedAgent) ?? agentOptions[0] ?? { key: selectedAgent, label: selectedAgent || "Agent" },
     [agentOptions, selectedAgent]
   );
+  const activeConversation = useMemo(
+    () => conversations.find((conversation) => conversation.id === activeId) ?? null,
+    [conversations, activeId]
+  );
+
+  const getGraphToken = useCallback(async (): Promise<string> => {
+    if (!account) throw new Error("No active account");
+    const graphRequest = { scopes: ["User.Read"], account };
+    try {
+      const tokenResponse = await instance.acquireTokenSilent(graphRequest);
+      return tokenResponse.accessToken;
+    } catch {
+      const tokenResponse = await instance.acquireTokenPopup(graphRequest);
+      return tokenResponse.accessToken;
+    }
+  }, [account, instance]);
 
   // Fetch agents the authenticated user can access (role-filtered from Cosmos)
   useEffect(() => {
@@ -48,16 +71,10 @@ export default function App() {
     (async () => {
       try {
         // Acquire a Graph-scoped token to pass to the backend
-        const graphRequest = { scopes: ["User.Read"], account };
-        let tokenResponse;
-        try {
-          tokenResponse = await instance.acquireTokenSilent(graphRequest);
-        } catch {
-          tokenResponse = await instance.acquireTokenPopup(graphRequest);
-        }
+        const graphToken = await getGraphToken();
 
         const resp = await fetch("/api/my-agents", {
-          headers: { Authorization: `Bearer ${tokenResponse.accessToken}` },
+          headers: { Authorization: `Bearer ${graphToken}` },
         });
         if (!resp.ok) throw new Error(`Failed: ${resp.status}`);
         const payload = await resp.json();
@@ -101,7 +118,84 @@ export default function App() {
     })();
 
     return () => { cancelled = true; };
-  }, [account, instance]);
+  }, [account, getGraphToken]);
+
+  useEffect(() => {
+    if (!account) {
+      conversationsLoadedRef.current = false;
+      setConversations([]);
+      setActiveId(null);
+      setLoadingConversations(false);
+      return;
+    }
+
+    let cancelled = false;
+    conversationsLoadedRef.current = false;
+    setLoadingConversations(true);
+
+    (async () => {
+      try {
+        const graphToken = await getGraphToken();
+        const resp = await fetch("/api/conversations", {
+          headers: { Authorization: `Bearer ${graphToken}` },
+        });
+        if (!resp.ok) throw new Error(`Failed: ${resp.status}`);
+        const payload = await resp.json();
+        if (cancelled) return;
+        const loaded: Conversation[] = (payload.conversations ?? []).map((conversation: any) => ({
+          id: String(conversation.id),
+          name: conversation.name || "New Chat",
+          createdAt: Number(conversation.createdAt) || Date.now(),
+          updatedAt: Number(conversation.updatedAt) || Number(conversation.createdAt) || Date.now(),
+          agent: conversation.agent || "",
+          messages: Array.isArray(conversation.messages) ? conversation.messages : [],
+        }));
+        skipNextConversationSaveRef.current = true;
+        setConversations(loaded);
+        setActiveId((current) => (current && loaded.some((conversation) => conversation.id === current) ? current : null));
+      } catch (err) {
+        console.error("Failed to load conversations:", err);
+        if (!cancelled) {
+          skipNextConversationSaveRef.current = true;
+          setConversations([]);
+          setActiveId(null);
+        }
+      } finally {
+        if (!cancelled) {
+          conversationsLoadedRef.current = true;
+          setLoadingConversations(false);
+        }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [account, getGraphToken]);
+
+  useEffect(() => {
+    if (!account || !conversationsLoadedRef.current) return;
+    if (skipNextConversationSaveRef.current) {
+      skipNextConversationSaveRef.current = false;
+      return;
+    }
+
+    const timeout = window.setTimeout(async () => {
+      try {
+        const graphToken = await getGraphToken();
+        await fetch("/api/conversations", {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${graphToken}`,
+          },
+          body: JSON.stringify({ conversations }),
+        });
+      } catch (err) {
+        console.error("Failed to save conversations:", err);
+      }
+    }, 500);
+
+    return () => window.clearTimeout(timeout);
+  }, [account, conversations, getGraphToken]);
 
   /** Acquire user-scoped access tokens for Fabric and semantic model queries. */
   const getToken = useCallback(async (): Promise<{ fabricToken: string; powerBiToken: string }> => {
@@ -147,10 +241,21 @@ export default function App() {
       id: crypto.randomUUID(),
       name: "New Chat",
       createdAt: Date.now(),
+      updatedAt: Date.now(),
+      agent: selectedAgentOption?.key ?? selectedAgent ?? "",
+      messages: [],
     };
     setConversations((prev) => [conv, ...prev]);
     setActiveId(conv.id);
-  }, []);
+  }, [selectedAgent, selectedAgentOption]);
+
+  const openConversation = useCallback((id: string) => {
+    const conversation = conversations.find((candidate) => candidate.id === id);
+    if (conversation?.agent) {
+      setSelectedAgent(conversation.agent);
+    }
+    setActiveId(id);
+  }, [conversations]);
 
   const selectAgent = useCallback(
     (agent: string) => {
@@ -160,6 +265,9 @@ export default function App() {
         id: crypto.randomUUID(),
         name: "New Chat",
         createdAt: Date.now(),
+        updatedAt: Date.now(),
+        agent,
+        messages: [],
       };
       setConversations((prev) => [conv, ...prev]);
       setActiveId(conv.id);
@@ -173,14 +281,33 @@ export default function App() {
       if (activeId === id) {
         setActiveId(null);
       }
-      fetch(`/api/chat/${id}`, { method: "DELETE" }).catch(() => {});
+      (async () => {
+        try {
+          const graphToken = await getGraphToken();
+          await fetch(`/api/conversations/${id}`, {
+            method: "DELETE",
+            headers: { Authorization: `Bearer ${graphToken}` },
+          });
+        } catch {}
+        fetch(`/api/chat/${id}`, { method: "DELETE" }).catch(() => {});
+      })();
     },
-    [activeId]
+    [activeId, getGraphToken]
   );
 
   const renameConversation = useCallback((id: string, name: string) => {
     setConversations((prev) =>
-      prev.map((c) => (c.id === id ? { ...c, name } : c))
+      prev.map((c) => (c.id === id ? { ...c, name, updatedAt: Date.now() } : c))
+    );
+  }, []);
+
+  const updateConversationMessages = useCallback((id: string, messages: Message[] | ((previous: Message[]) => Message[])) => {
+    setConversations((prev) =>
+      prev.map((conversation) => {
+        if (conversation.id !== id) return conversation;
+        const nextMessages = typeof messages === "function" ? messages(conversation.messages) : messages;
+        return { ...conversation, messages: nextMessages, updatedAt: Date.now() };
+      })
     );
   }, []);
 
@@ -203,7 +330,7 @@ export default function App() {
             open={sidebarOpen}
             onToggle={() => setSidebarOpen((o) => !o)}
             onCreate={createConversation}
-            onSelect={setActiveId}
+            onSelect={openConversation}
             onDelete={deleteConversation}
             onRename={renameConversation}
             onToggleDark={toggleDarkMode}
@@ -216,19 +343,22 @@ export default function App() {
           />
 
           <main className="flex-1 flex flex-col min-w-0">
-            {activeId ? (
+            {activeId && activeConversation ? (
               <ChatPanel
                 key={activeId}
                 conversationId={activeId}
                 onRename={(name) => renameConversation(activeId, name)}
+                messages={activeConversation.messages}
+                setMessages={(messages) => updateConversationMessages(activeId, messages)}
                 onToggleSidebar={() => setSidebarOpen((o) => !o)}
                 sidebarOpen={sidebarOpen}
                 getToken={getToken}
+                userId={account?.localAccountId ?? account?.homeAccountId ?? account?.username ?? "default_user"}
                 selectedAgent={selectedAgentOption.key}
                 selectedAgentLabel={selectedAgentOption.label}
               />
             ) : (
-              <EmptyState onCreate={createConversation} />
+              <EmptyState onCreate={createConversation} loading={loadingConversations} />
             )}
           </main>
         </div>
@@ -241,14 +371,14 @@ export default function App() {
   );
 }
 
-function EmptyState({ onCreate }: { onCreate: () => void }) {
+function EmptyState({ onCreate, loading }: { onCreate: () => void; loading?: boolean }) {
   return (
     <div className="flex-1 flex items-center justify-center">
       <div className="text-center space-y-4">
         <div className="text-5xl">💬</div>
         <h1 className="text-2xl font-semibold">Fabric Agents</h1>
         <p className="text-gray-500 dark:text-gray-400 max-w-md">
-          Ask questions about data in Fabric.
+          {loading ? "Loading your conversations..." : "Ask questions about data in Fabric."}
         </p>
         <button
           onClick={onCreate}

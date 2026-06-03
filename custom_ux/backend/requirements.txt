@@ -3,6 +3,7 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.34.0
 aiohttp
 azure-identity>=1.19.0
+azure-cosmos>=4.7.0
 python-dotenv
 
 # Mem0 memory with Azure AI Search (optional)

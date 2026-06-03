@@ -7,9 +7,12 @@ export type AgentTarget = string;
 interface Props {
   conversationId: string;
   onRename: (name: string) => void;
+  messages: Message[];
+  setMessages: React.Dispatch<React.SetStateAction<Message[]>>;
   onToggleSidebar: () => void;
   sidebarOpen: boolean;
   getToken: () => Promise<{ fabricToken: string; powerBiToken: string }>;
+  userId: string;
   selectedAgent: AgentTarget;
   selectedAgentLabel: string;
 }
@@ -22,13 +25,15 @@ interface ToolCallState {
 export default function ChatPanel({
   conversationId,
   onRename,
+  messages,
+  setMessages,
   onToggleSidebar,
   sidebarOpen,
   getToken,
+  userId,
   selectedAgent,
   selectedAgentLabel,
 }: Props) {
-  const [messages, setMessages] = useState<Message[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [toolCalls, setToolCalls] = useState<Map<string, ToolCallState>>(
     new Map()
@@ -36,6 +41,10 @@ export default function ChatPanel({
   const scrollRef = useRef<HTMLDivElement>(null);
   const hasNamedRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    hasNamedRef.current = messages.length > 0;
+  }, [conversationId, messages.length]);
 
   // Auto-scroll on new content
   useEffect(() => {
@@ -78,6 +87,7 @@ export default function ChatPanel({
           body: JSON.stringify({
             message: text,
             conversation_id: conversationId,
+            user_id: userId,
             agent: selectedAgent,
             powerbi_token: powerBiToken,
           }),
@@ -165,7 +175,7 @@ export default function ChatPanel({
         abortRef.current = null;
       }
     },
-    [conversationId, messages.length, onRename, streaming, getToken, selectedAgent]
+    [conversationId, messages.length, onRename, streaming, getToken, selectedAgent, userId]
   );
 
   const handleStop = useCallback(() => {

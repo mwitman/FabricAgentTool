@@ -67,6 +67,20 @@ FABRIC_API_ROOT = "https://api.fabric.microsoft.com"
 POWERBI_API = "https://api.powerbi.com/v1.0/myorg"
 FABRIC_OPERATION_POLL_LIMIT = 12
 SEMANTIC_SOURCE_TYPE = "semantic_model"
+SEMANTIC_MODEL_TYPES = {"SemanticModel", "PowerBIDataset"}
+GRAPHQL_TYPES = {"GraphQLApi"}
+SQL_ENDPOINT_TYPES = {"SQLEndpoint", "Warehouse"}
+DATA_AGENT_TYPES = {"DataAgent", "FabricDataAgent", "DataAgentItem", "FabricDataAgentItem"}
+FABRIC_ITEM_TYPE_MAP: dict[str, str] = {}
+for _type in SEMANTIC_MODEL_TYPES:
+    FABRIC_ITEM_TYPE_MAP[_type] = SEMANTIC_SOURCE_TYPE
+for _type in GRAPHQL_TYPES:
+    FABRIC_ITEM_TYPE_MAP[_type] = "graphql"
+for _type in SQL_ENDPOINT_TYPES:
+    FABRIC_ITEM_TYPE_MAP[_type] = "sql_endpoint"
+for _type in DATA_AGENT_TYPES:
+    FABRIC_ITEM_TYPE_MAP[_type] = "data_agent"
+FABRIC_ITEM_TYPE_NORMALIZED_MAP = {re.sub(r"[^a-z0-9]", "", key.lower()): value for key, value in FABRIC_ITEM_TYPE_MAP.items()}
 FABRIC_MCP_SOURCE_TYPES = {"fabric_mcp", "sql_endpoint", "data_agent"}
 NON_SEMANTIC_SOURCE_TYPES = {"fabric_mcp", "graphql", "sql_endpoint", "data_agent"}
 
@@ -134,7 +148,7 @@ def _build_instructions(project: dict[str, Any]) -> str:
                 f"{agent.get('description', '')} "
                 f"Configured data sources: {source_summary}. "
                 "Use the available Fabric tools for GraphQL APIs, SQL endpoints, Fabric Data Agents, and Fabric MCP. "
-                "For SQL endpoints, Data Agents, and broad Fabric discovery, use the Fabric MCP tools."
+                "For Fabric MCP, discover accessible Fabric items first, then use the matching semantic model, GraphQL, SQL endpoint, Data Agent, or item definition tool."
             )
         model_name = _source_item_name(agent.get("semantic_model", {})) or "the configured semantic model"
         return (
@@ -169,7 +183,7 @@ def _build_instructions(project: dict[str, Any]) -> str:
         f"You route questions to subagents: {', '.join(subagent_names)}. "
         f"Configured data sources: {source_summary}. "
         "Use the available Fabric tools for each configured source type. "
-        "Use semantic model tools for DAX, GraphQL tools for Fabric GraphQL APIs, and Fabric MCP tools for SQL endpoints, Fabric Data Agents, and broad Fabric operations."
+        "For Fabric MCP, discover accessible Fabric items first, then use semantic model tools for DAX, GraphQL tools for Fabric GraphQL APIs, SQL endpoint tools for SQL, Fabric Data Agent tools for Data Agents, and item definition tools for Fabric metadata."
     )
 
 
@@ -177,11 +191,18 @@ def _with_runtime_tool_policy(prompt: str, configured_sources: list[dict[str, An
     if not configured_sources:
         return prompt
     data_agent_sources = [source for source in configured_sources if source.get("source_type") == "data_agent"]
+    has_fabric_mcp = any(_source_type(source) == "fabric_mcp" for source in configured_sources)
     policy = [
         "Runtime tool-use policy:",
         f"Configured data sources: {_format_data_source_summary(configured_sources)}.",
         "Use the available Fabric tools for configured sources before deciding a request is out of scope.",
     ]
+    if has_fabric_mcp:
+        policy.extend([
+            "For Fabric MCP, use discover_accessible_fabric_items to find accessible semantic models, GraphQL APIs, SQL endpoints, Warehouses, Data Agents, and other supported Fabric items.",
+            "After discovery, use the matching tool for the discovered item type: semantic model metadata and DAX tools for semantic models, GraphQL tools for GraphQL APIs, SQL tools for SQL endpoints and Warehouses, Data Agent tools for Data Agents, and item definition tools for Fabric metadata.",
+            "Do not require item IDs to be preconfigured when Fabric MCP is enabled; use the user's Fabric token and the discovered workspace_id and item_id values.",
+        ])
     if data_agent_sources:
         policy.extend([
             "For a configured Fabric Data Agent, treat broad analytical questions about that data source, including trends, summaries, and 'all my data' phrasing, as in scope for that Fabric Data Agent.",
@@ -418,6 +439,8 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
     sql_sources = _get_sources_by_type(project, "sql_endpoint")
     data_agent_sources = _get_sources_by_type(project, "data_agent")
     uses_fabric_mcp = _uses_fabric_mcp(project)
+    allow_dynamic_fabric_items = any(_source_type(source) == "fabric_mcp" for source in data_sources)
+    has_semantic_model_access = bool(semantic_models) or allow_dynamic_fabric_items
     effective_powerbi_token = powerbi_token or fabric_token
 
     @ai_function(
@@ -445,6 +468,50 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
             }
             for sm in semantic_models
         ], indent=2)
+
+    @ai_function(
+        name="discover_accessible_fabric_items",
+        description=(
+            "Search Fabric workspaces for supported items the signed-in user can access. "
+            "Use source_type to filter to semantic_model, graphql, sql_endpoint, data_agent, or leave it blank for all. "
+            "Use this first for Fabric MCP all-up questions before choosing item IDs for downstream tools."
+        ),
+    )
+    async def discover_accessible_fabric_items(search_text: str = "", source_type: str = "") -> str:
+        if not allow_dynamic_fabric_items:
+            return json.dumps({"error": "Dynamic Fabric item discovery is only enabled for Fabric MCP projects."})
+        payload = await _discover_accessible_fabric_items(fabric_token, search_text, source_type)
+        return json.dumps(payload, indent=2)
+
+    def _can_query_semantic_model(workspace_id: str, semantic_model_id: str) -> bool:
+        return allow_dynamic_fabric_items or any(
+            source.get("workspace_id") == workspace_id and _source_item_id(source) == semantic_model_id
+            for source in semantic_models
+        )
+
+    def _can_query_graphql(workspace_id: str, graphql_api_id: str) -> bool:
+        return allow_dynamic_fabric_items or any(
+            source.get("workspace_id") == workspace_id and source.get("item_id") == graphql_api_id
+            for source in graphql_sources
+        )
+
+    def _can_query_sql_endpoint(workspace_id: str, sql_endpoint_id: str) -> bool:
+        return allow_dynamic_fabric_items or any(
+            source.get("workspace_id") == workspace_id and source.get("item_id") == sql_endpoint_id
+            for source in sql_sources
+        )
+
+    def _can_invoke_data_agent(workspace_id: str, data_agent_id: str) -> bool:
+        return allow_dynamic_fabric_items or any(
+            source.get("workspace_id") == workspace_id and source.get("item_id") == data_agent_id
+            for source in data_agent_sources
+        )
+
+    def _can_get_fabric_item(workspace_id: str, item_id: str) -> bool:
+        return allow_dynamic_fabric_items or any(
+            source.get("workspace_id") == workspace_id and source.get("item_id") == item_id
+            for source in data_sources
+        )
 
     async def _call_fabric_mcp_jsonrpc(method: str, params: dict[str, Any]) -> str:
         payload = {"jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": method, "params": params}
@@ -480,7 +547,7 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
         ),
     )
     async def query_fabric_graphql(workspace_id: str, graphql_api_id: str, query: str, variables_json: str = "{}") -> str:
-        if not any(source.get("workspace_id") == workspace_id and source.get("item_id") == graphql_api_id for source in graphql_sources):
+        if not _can_query_graphql(workspace_id, graphql_api_id):
             return json.dumps({"error": "That GraphQL API is not configured for this agent project."})
         try:
             variables = json.loads(variables_json or "{}")
@@ -539,7 +606,7 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
         ),
     )
     async def execute_fabric_sql_query(workspace_id: str, sql_endpoint_id: str, sql_query: str) -> str:
-        if not any(source.get("workspace_id") == workspace_id and source.get("item_id") == sql_endpoint_id for source in sql_sources):
+        if not _can_query_sql_endpoint(workspace_id, sql_endpoint_id):
             return json.dumps({"error": "That SQL endpoint is not configured for this agent project."})
         if not _is_readonly_sql(sql_query):
             return json.dumps({"errors": [{"message": "Only read-only SQL queries starting with SELECT or WITH are allowed."}]})
@@ -569,7 +636,7 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
         ),
     )
     async def invoke_fabric_data_agent(workspace_id: str, data_agent_id: str, prompt: str) -> str:
-        if not any(source.get("workspace_id") == workspace_id and source.get("item_id") == data_agent_id for source in data_agent_sources):
+        if not _can_invoke_data_agent(workspace_id, data_agent_id):
             return json.dumps({"error": "That Fabric Data Agent is not configured for this agent project."})
         tool_name = os.environ.get("FABRIC_MCP_DATA_AGENT_TOOL_NAME", "invoke_data_agent")
         return await _call_fabric_mcp_jsonrpc(
@@ -597,7 +664,7 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
         ),
     )
     async def get_fabric_item_definition(workspace_id: str, item_id: str, format: str = "") -> str:
-        if not any(source.get("workspace_id") == workspace_id and source.get("item_id") == item_id for source in data_sources):
+        if not _can_get_fabric_item(workspace_id, item_id):
             return json.dumps({"error": "That Fabric item is not configured for this agent project."})
         suffix = f"?format={format}" if format else ""
         async with aiohttp.ClientSession() as session:
@@ -609,15 +676,17 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
         description="Get table and column metadata for a Fabric semantic model. Call this before writing DAX.",
     )
     async def get_semantic_model_metadata(workspace_id: str, semantic_model_id: str) -> str:
-        if not any(source.get("workspace_id") == workspace_id and _source_item_id(source) == semantic_model_id for source in semantic_models):
+        if not _can_query_semantic_model(workspace_id, semantic_model_id):
             return json.dumps({"error": "That semantic model is not configured for this agent project."})
         dataset_url = f"{POWERBI_API}/groups/{workspace_id}/datasets/{semantic_model_id}"
         async with aiohttp.ClientSession() as session:
-            tables = await _get_json(session, f"{dataset_url}/tables", _powerbi_headers(effective_powerbi_token))
+            tables = await _semantic_model_tables_from_dax(session, dataset_url, effective_powerbi_token)
             if tables.get("errors"):
-                tables = await _semantic_model_tables_from_fabric_definition(
-                    session, workspace_id, semantic_model_id, fabric_token
-                )
+                tables = await _get_json(session, f"{dataset_url}/tables", _powerbi_headers(effective_powerbi_token))
+            if tables.get("errors"):
+                definition_tables = await _semantic_model_tables_from_fabric_definition(session, workspace_id, semantic_model_id, fabric_token)
+                if definition_tables.get("value") or definition_tables.get("errors"):
+                    tables = definition_tables
         return json.dumps({"workspace_id": workspace_id, "semantic_model_id": semantic_model_id, "tables": tables}, indent=2)
 
     @ai_function(
@@ -628,7 +697,7 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
         ),
     )
     async def execute_dax_query(workspace_id: str, semantic_model_id: str, dax_query: str) -> str:
-        if not any(source.get("workspace_id") == workspace_id and _source_item_id(source) == semantic_model_id for source in semantic_models):
+        if not _can_query_semantic_model(workspace_id, semantic_model_id):
             return json.dumps({"errors": [{"message": "That semantic model is not configured for this agent project."}]})
         if not _is_readonly_dax(dax_query):
             return json.dumps({"errors": [{"message": "Only read-only DAX queries starting with EVALUATE are allowed."}]})
@@ -647,13 +716,17 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
                 return json.dumps({"query": dax_query, "row_count": len(rows), "rows": rows[:50]}, indent=2)
 
     tools = [list_configured_fabric_data_sources]
-    if semantic_models:
+    if allow_dynamic_fabric_items:
+        tools.append(discover_accessible_fabric_items)
+    if has_semantic_model_access:
         tools.extend([list_configured_semantic_models, get_semantic_model_metadata, execute_dax_query])
-    if graphql_sources:
+    if graphql_sources or allow_dynamic_fabric_items:
         tools.extend([query_fabric_graphql, get_fabric_item_definition])
-    if sql_sources:
+    elif data_sources:
+        tools.append(get_fabric_item_definition)
+    if sql_sources or allow_dynamic_fabric_items:
         tools.append(execute_fabric_sql_query)
-    if data_agent_sources:
+    if data_agent_sources or allow_dynamic_fabric_items:
         tools.append(invoke_fabric_data_agent)
     if uses_fabric_mcp:
         tools.extend([call_fabric_mcp, call_fabric_mcp_tool])
@@ -1033,6 +1106,120 @@ async def _semantic_model_tables_from_fabric_definition(session: aiohttp.ClientS
     return {"value": _merge_tables(tables), "source": "fabricDefinition"}
 
 
+async def _discover_accessible_fabric_items(fabric_token: str, search_text: str = "", source_type: str = "") -> dict[str, Any]:
+    search_lower = search_text.lower().strip()
+    source_type = source_type.strip().lower()
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    async with aiohttp.ClientSession() as session:
+        workspaces_payload = await _get_json(session, f"{FABRIC_API}/workspaces", _fabric_headers(fabric_token))
+        if "errors" in workspaces_payload:
+            return {"items": [], "errors": workspaces_payload["errors"]}
+        for workspace in workspaces_payload.get("value", []):
+            workspace_id = workspace.get("id")
+            if not workspace_id:
+                continue
+            items_payload = await _get_json(session, f"{FABRIC_API}/workspaces/{workspace_id}/items", _fabric_headers(fabric_token))
+            if "errors" in items_payload:
+                errors.extend(items_payload["errors"])
+                continue
+            for item in items_payload.get("value", []):
+                item_type = str(item.get("type") or item.get("itemType") or "")
+                mapped_type = _map_fabric_item_type(item_type)
+                if not mapped_type:
+                    continue
+                if source_type and mapped_type != source_type:
+                    continue
+                name = item.get("displayName") or item.get("name") or ""
+                workspace_name = workspace.get("displayName") or workspace.get("name") or ""
+                score = _score(search_lower, name, workspace_name, item_type, mapped_type.replace("_", " "))
+                if search_lower and score == 0:
+                    continue
+                results.append(
+                    {
+                        "source_type": mapped_type,
+                        "workspace_id": workspace_id,
+                        "workspace_name": workspace_name,
+                        "item_id": item.get("id"),
+                        "item_name": name,
+                        "semantic_model_id": item.get("id") if mapped_type == SEMANTIC_SOURCE_TYPE else "",
+                        "semantic_model_name": name if mapped_type == SEMANTIC_SOURCE_TYPE else "",
+                        "type": item_type,
+                        "score": score,
+                    }
+                )
+    results.sort(key=lambda model: model.get("score", 0), reverse=True)
+    return {"items": results[:25], "errors": errors}
+
+
+def _map_fabric_item_type(item_type: str) -> str:
+    return FABRIC_ITEM_TYPE_MAP.get(item_type) or FABRIC_ITEM_TYPE_NORMALIZED_MAP.get(re.sub(r"[^a-z0-9]", "", item_type.lower()), "")
+
+
+async def _semantic_model_tables_from_dax(session: aiohttp.ClientSession, dataset_url: str, powerbi_token: str) -> dict[str, Any]:
+    tables_payload = await _execute_dax(session, dataset_url, powerbi_token, "EVALUATE INFO.TABLES()")
+    columns_payload = await _execute_dax(session, dataset_url, powerbi_token, "EVALUATE INFO.COLUMNS()")
+    measures_payload = await _execute_dax(session, dataset_url, powerbi_token, "EVALUATE INFO.MEASURES()")
+    errors = []
+    for payload in [tables_payload, columns_payload, measures_payload]:
+        errors.extend(payload.get("errors", []))
+    if errors:
+        return {"value": [], "errors": errors, "source": "executeQueries"}
+
+    table_rows = _query_rows(tables_payload)
+    column_rows = _query_rows(columns_payload)
+    measure_rows = _query_rows(measures_payload)
+    table_by_id: dict[str, dict[str, Any]] = {}
+    table_by_name: dict[str, dict[str, Any]] = {}
+    for row in table_rows:
+        table_id = str(_row_value(row, "ID", "TableID") or "")
+        name = _row_value(row, "Name", "ExplicitName")
+        if not name:
+            continue
+        table = {
+            "id": table_id,
+            "name": name,
+            "description": _row_value(row, "Description") or "",
+            "isHidden": _row_value(row, "IsHidden") or False,
+            "columns": [],
+            "measures": [],
+        }
+        if table_id:
+            table_by_id[table_id] = table
+        table_by_name[str(name)] = table
+
+    for row in column_rows:
+        table = _table_for_row(row, table_by_id, table_by_name)
+        if table is None:
+            continue
+        name = _row_value(row, "ExplicitName", "Name")
+        if name:
+            table["columns"].append({"name": name, "dataType": _row_value(row, "InferredDataType", "DataType"), "isHidden": _row_value(row, "IsHidden") or False})
+
+    for row in measure_rows:
+        table = _table_for_row(row, table_by_id, table_by_name)
+        if table is None:
+            continue
+        name = _row_value(row, "Name", "ExplicitName")
+        if name:
+            table["measures"].append({"name": name, "expression": _row_value(row, "Expression"), "isHidden": _row_value(row, "IsHidden") or False})
+
+    return {"value": list(table_by_name.values()), "source": "executeQueries"}
+
+
+async def _execute_dax(session: aiohttp.ClientSession, dataset_url: str, powerbi_token: str, query: str) -> dict[str, Any]:
+    body = {"queries": [{"query": query}], "serializerSettings": {"includeNulls": True}}
+    async with session.post(f"{dataset_url}/executeQueries", headers=_powerbi_headers(powerbi_token), json=body) as response:
+        text = await response.text()
+        try:
+            payload = json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            payload = {"raw": text}
+        if response.status >= 400:
+            return {"errors": [{"status": response.status, "url": f"{dataset_url}/executeQueries", "message": payload, "query": query}]}
+        return payload
+
+
 def _decode_definition_payload(part: dict[str, Any]) -> str:
     payload = part.get("payload") or part.get("content") or ""
     if not payload:
@@ -1079,6 +1266,14 @@ def _merge_tables(tables: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(merged.values())
 
 
+def _score(search_text: str, model_name: str, workspace_name: str, *extra_fields: str) -> int:
+    if not search_text:
+        return 1
+    combined = " ".join([model_name, workspace_name, *extra_fields]).lower()
+    terms = [term for term in search_text.replace("_", " ").replace("-", " ").split() if len(term) > 2]
+    return sum(10 for term in terms if term in combined)
+
+
 def _is_readonly_dax(query: str) -> bool:
     normalized = re.sub(r"--.*?$|/\*.*?\*/", " ", query, flags=re.MULTILINE | re.DOTALL).strip().lower()
     if not normalized.startswith("evaluate") and not normalized.startswith("define"):
@@ -1092,6 +1287,24 @@ def _query_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
         return payload.get("results", [])[0].get("tables", [])[0].get("rows", [])
     except (IndexError, AttributeError):
         return []
+
+
+def _row_value(row: dict[str, Any], *names: str) -> Any:
+    for name in names:
+        for key, value in row.items():
+            if key.split("[")[-1].rstrip("]").lower() == name.lower():
+                return value
+    return None
+
+
+def _table_for_row(row: dict[str, Any], table_by_id: dict[str, dict[str, Any]], table_by_name: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    table_id = _row_value(row, "TableID")
+    if table_id is not None and str(table_id) in table_by_id:
+        return table_by_id[str(table_id)]
+    table_name = _row_value(row, "Table", "TableName")
+    if table_name is not None:
+        return table_by_name.get(str(table_name))
+    return None
 
 
 # ---------------------------------------------------------------------------

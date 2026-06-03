@@ -65,6 +65,8 @@ FOUNDRY_FEATURES = os.environ.get("FOUNDRY_FEATURES", "HostedAgents=V1Preview")
 _azure_credential: DefaultAzureCredential | None = None
 _conversation_history: dict[str, list[dict[str, str]]] = {}
 _history_turn_limit = 8
+_conversation_store = None
+_local_history_file = _backend_dir / "data" / "conversation_history.json"
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +274,193 @@ def _get_all_agent_bindings() -> list[dict[str, Any]]:
         enable_cross_partition_query=True,
     ))
 
+
+async def _resolve_user_from_graph_token(request: Request) -> dict[str, str] | JSONResponse:
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return JSONResponse({"error": "Bearer token required."}, status_code=401)
+    user_token = auth_header[len("Bearer "):]
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            "https://graph.microsoft.com/v1.0/me?$select=id,displayName,userPrincipalName,mail",
+            headers={"Authorization": f"Bearer {user_token}"},
+        ) as resp:
+            if resp.status != 200:
+                return JSONResponse({"error": "Failed to resolve user identity from Graph."}, status_code=401)
+            me = await resp.json()
+
+    user_id = me.get("id", "")
+    if not user_id:
+        return JSONResponse({"error": "Could not determine user object ID."}, status_code=401)
+
+    return {
+        "id": user_id,
+        "display_name": me.get("displayName") or me.get("userPrincipalName") or "User",
+        "user_principal_name": me.get("userPrincipalName") or me.get("mail") or "",
+    }
+
+
+def _conversation_history_key(user_id: str, conversation_id: str) -> str:
+    return f"{user_id}:{conversation_id}"
+
+
+def _history_partition_key_path() -> str:
+    value = os.environ.get("CUSTOM_UX_HISTORY_PARTITION_KEY", "/userid").strip()
+    if not value:
+        return "/userid"
+    return value if value.startswith("/") else f"/{value}"
+
+
+def _history_partition_field() -> str:
+    return _history_partition_key_path().strip("/") or "userid"
+
+
+def _sanitize_messages(messages: Any) -> list[dict[str, str]]:
+    if not isinstance(messages, list):
+        return []
+    sanitized: list[dict[str, str]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            continue
+        sanitized.append({"role": role, "content": content})
+    return sanitized
+
+
+def _sanitize_conversation(user_id: str, raw: dict[str, Any], conversation_id: str | None = None) -> dict[str, Any]:
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    conv_id = str(conversation_id or raw.get("id") or uuid.uuid4())
+    created_at = raw.get("createdAt") if isinstance(raw.get("createdAt"), (int, float)) else now_ms
+    updated_at = raw.get("updatedAt") if isinstance(raw.get("updatedAt"), (int, float)) else now_ms
+    name = raw.get("name") if isinstance(raw.get("name"), str) and raw.get("name").strip() else "New Chat"
+    doc = {
+        "id": conv_id,
+        "type": "user_conversation",
+        "userid": user_id,
+        "name": name.strip(),
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+        "agent": str(raw.get("agent") or ""),
+        "messages": _sanitize_messages(raw.get("messages")),
+    }
+    doc[_history_partition_field()] = user_id
+    return doc
+
+
+def _conversation_response(doc: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": doc.get("id", ""),
+        "name": doc.get("name") or "New Chat",
+        "createdAt": doc.get("createdAt") or doc.get("updatedAt") or 0,
+        "updatedAt": doc.get("updatedAt") or doc.get("createdAt") or 0,
+        "agent": doc.get("agent") or "",
+        "messages": _sanitize_messages(doc.get("messages")),
+    }
+
+
+def _history_container():
+    global _conversation_store
+    if _conversation_store is not None:
+        return _conversation_store
+
+    endpoint = os.environ.get("AGENT_MGMT_COSMOS_ENDPOINT", "").strip()
+    if not endpoint:
+        return None
+
+    try:
+        from azure.cosmos import CosmosClient, PartitionKey
+
+        client = CosmosClient(endpoint, credential=_cosmos_credential())
+        database_name = os.environ.get("CUSTOM_UX_HISTORY_DATABASE", "customux")
+        container_name = os.environ.get("CUSTOM_UX_HISTORY_CONTAINER", "conversationhistory")
+        partition_key_path = _history_partition_key_path()
+        db = client.create_database_if_not_exists(database_name)
+        _conversation_store = db.create_container_if_not_exists(
+            id=container_name,
+            partition_key=PartitionKey(path=partition_key_path),
+        )
+        return _conversation_store
+    except Exception as exc:
+        import logging
+        logging.getLogger("custom_ux").warning("Conversation history store unavailable: %s", exc)
+        return None
+
+
+def _read_local_history() -> dict[str, list[dict[str, Any]]]:
+    if not _local_history_file.exists():
+        return {}
+    try:
+        with _local_history_file.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_local_history(data: dict[str, list[dict[str, Any]]]) -> None:
+    _local_history_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = _local_history_file.with_suffix(".tmp")
+    with temp_file.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+    temp_file.replace(_local_history_file)
+
+
+def _list_user_conversations(user_id: str) -> list[dict[str, Any]]:
+    container = _history_container()
+    if container is not None:
+        docs = list(container.query_items(
+            query="SELECT * FROM c WHERE c.userid = @userid AND c.type = 'user_conversation'",
+            parameters=[{"name": "@userid", "value": user_id}],
+            partition_key=user_id,
+        ))
+        return sorted((_conversation_response(doc) for doc in docs), key=lambda doc: doc.get("updatedAt") or 0, reverse=True)
+
+    data = _read_local_history()
+    return sorted((_conversation_response(doc) for doc in data.get(user_id, [])), key=lambda doc: doc.get("updatedAt") or 0, reverse=True)
+
+
+def _replace_user_conversations(user_id: str, conversations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized = [_sanitize_conversation(user_id, conversation) for conversation in conversations if isinstance(conversation, dict)]
+    container = _history_container()
+    if container is not None:
+        existing = list(container.query_items(
+            query="SELECT c.id FROM c WHERE c.userid = @userid AND c.type = 'user_conversation'",
+            parameters=[{"name": "@userid", "value": user_id}],
+            partition_key=user_id,
+        ))
+        next_ids = {conversation["id"] for conversation in sanitized}
+        for doc in existing:
+            doc_id = doc.get("id")
+            if doc_id and doc_id not in next_ids:
+                container.delete_item(item=doc_id, partition_key=user_id)
+        for conversation in sanitized:
+            container.upsert_item(conversation)
+        return sorted((_conversation_response(doc) for doc in sanitized), key=lambda doc: doc.get("updatedAt") or 0, reverse=True)
+
+    data = _read_local_history()
+    data[user_id] = sanitized
+    _write_local_history(data)
+    return sorted((_conversation_response(doc) for doc in sanitized), key=lambda doc: doc.get("updatedAt") or 0, reverse=True)
+
+
+def _delete_user_conversation(user_id: str, conversation_id: str) -> None:
+    container = _history_container()
+    if container is not None:
+        try:
+            container.delete_item(item=conversation_id, partition_key=user_id)
+        except Exception:
+            pass
+    else:
+        data = _read_local_history()
+        data[user_id] = [doc for doc in data.get(user_id, []) if doc.get("id") != conversation_id]
+        _write_local_history(data)
+
+    _conversation_history.pop(_conversation_history_key(user_id, conversation_id), None)
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -316,8 +505,8 @@ def _foundry_responses_url(agent_name: str) -> str:
     )
 
 
-def _format_history_context(conversation_id: str) -> str:
-    history = _conversation_history.get(conversation_id, [])[-(_history_turn_limit * 2):]
+def _format_history_context(user_id: str, conversation_id: str) -> str:
+    history = _conversation_history.get(_conversation_history_key(user_id, conversation_id), [])[-(_history_turn_limit * 2):]
     if not history:
         return ""
 
@@ -330,8 +519,8 @@ def _format_history_context(conversation_id: str) -> str:
     return "\n".join(lines)
 
 
-def _append_history(conversation_id: str, user_message: str, assistant_message: str) -> None:
-    history = _conversation_history.setdefault(conversation_id, [])
+def _append_history(user_id: str, conversation_id: str, user_message: str, assistant_message: str) -> None:
+    history = _conversation_history.setdefault(_conversation_history_key(user_id, conversation_id), [])
     history.extend(
         [
             {"role": "user", "content": user_message},
@@ -482,7 +671,7 @@ async def chat(request: Request):
     enriched_message = message
     context_blocks: list[str] = []
 
-    history_context = _format_history_context(conversation_id)
+    history_context = _format_history_context(user_id, conversation_id)
     if history_context:
         context_blocks.append(f"[Conversation so far]\n{history_context}")
 
@@ -533,7 +722,7 @@ async def chat(request: Request):
                 _mem0_logger.warning("Mem0 add failed: %s", exc)
 
         if full_response:
-            _append_history(conversation_id, message, "".join(full_response))
+            _append_history(user_id, conversation_id, message, "".join(full_response))
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -543,7 +732,39 @@ async def chat(request: Request):
 # ---------------------------------------------------------------------------
 @app.delete("/api/chat/{conversation_id}")
 async def delete_conversation(conversation_id: str):
-    _conversation_history.pop(conversation_id, None)
+    stale_keys = [key for key in _conversation_history if key.endswith(f":{conversation_id}")]
+    for key in stale_keys:
+        _conversation_history.pop(key, None)
+    return {"status": "deleted", "conversation_id": conversation_id}
+
+
+@app.get("/api/conversations")
+async def list_conversations(request: Request):
+    user = await _resolve_user_from_graph_token(request)
+    if isinstance(user, JSONResponse):
+        return user
+    return {"user": user, "conversations": _list_user_conversations(user["id"])}
+
+
+@app.put("/api/conversations")
+async def save_conversations(request: Request):
+    user = await _resolve_user_from_graph_token(request)
+    if isinstance(user, JSONResponse):
+        return user
+    body = await request.json()
+    conversations = body.get("conversations", [])
+    if not isinstance(conversations, list):
+        return JSONResponse({"error": "conversations must be a list."}, status_code=400)
+    saved = _replace_user_conversations(user["id"], conversations)
+    return {"user": user, "conversations": saved}
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def delete_saved_conversation(conversation_id: str, request: Request):
+    user = await _resolve_user_from_graph_token(request)
+    if isinstance(user, JSONResponse):
+        return user
+    _delete_user_conversation(user["id"], conversation_id)
     return {"status": "deleted", "conversation_id": conversation_id}
 
 
@@ -602,24 +823,10 @@ async def my_agents(request: Request):
     Reads the user's OID from the Authorization token (via MS Graph /me),
     resolves their group memberships, then filters agent bindings by role.
     """
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return JSONResponse({"error": "Bearer token required."}, status_code=401)
-    user_token = auth_header[len("Bearer "):]
-
-    # Use the user's token to get their OID from Graph
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            "https://graph.microsoft.com/v1.0/me?$select=id,displayName",
-            headers={"Authorization": f"Bearer {user_token}"},
-        ) as resp:
-            if resp.status != 200:
-                return JSONResponse({"error": "Failed to resolve user identity from Graph."}, status_code=401)
-            me = await resp.json()
-            user_object_id = me.get("id", "")
-
-    if not user_object_id:
-        return JSONResponse({"error": "Could not determine user object ID."}, status_code=401)
+    user = await _resolve_user_from_graph_token(request)
+    if isinstance(user, JSONResponse):
+        return user
+    user_object_id = user["id"]
 
     # Resolve group memberships using service principal (transitiveMemberOf)
     group_ids: list[str] = []
