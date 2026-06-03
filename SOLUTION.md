@@ -12,18 +12,18 @@ The solution separates Foundry and Fabric authorization intentionally. The servi
 
 ```mermaid
 flowchart LR
-    User[Signed-in user] --> UX[Custom UX]
-    UX -->|Graph token| AgentsAPI[/api/my-agents]
-    UX -->|Fabric and Power BI tokens| ChatAPI[/api/chat]
+  User["Signed-in user"] --> UX["Custom UX"]
+  UX -->|Graph token| AgentsAPI["/api/my-agents"]
+  UX -->|Fabric and Power BI tokens| ChatAPI["/api/chat"]
 
-    AgentsAPI -->|service principal| CosmosRoles[(Cosmos DB permissions/roles)]
-    ChatAPI -->|service principal Foundry token| Foundry[Microsoft Foundry Hosted Agent]
+  AgentsAPI -->|service principal| CosmosRoles["Cosmos DB permissions/roles"]
+  ChatAPI -->|service principal Foundry token| Foundry["Microsoft Foundry Hosted Agent"]
 
-    Foundry --> Runtime[Hosted Agent Runtime Container]
-    Runtime -->|service principal| CosmosProjects[(Cosmos DB agents/agentmetadata)]
-    Runtime -->|service principal| LLM[Foundry model endpoint]
-    Runtime -->|user Fabric token| Fabric[Fabric APIs / GraphQL / MCP]
-    Runtime -->|user Power BI token| PowerBI[Power BI APIs]
+  Foundry --> Runtime["Hosted Agent Runtime Container"]
+  Runtime -->|service principal| CosmosProjects["Cosmos DB agents/agentmetadata"]
+  Runtime -->|service principal| LLM["Foundry model endpoint"]
+  Runtime -->|user Fabric token| Fabric["Fabric APIs / GraphQL / MCP"]
+  Runtime -->|user Power BI token| PowerBI["Power BI APIs"]
 ```
 
 ## Applications
