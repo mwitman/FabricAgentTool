@@ -15,7 +15,7 @@ from azure.cosmos import CosmosClient
 from azure.cosmos.exceptions import CosmosResourceNotFoundError
 from azure.identity import AzureCliCredential, ClientSecretCredential, DefaultAzureCredential
 
-from .models import AgentRoleBinding, Role
+from .models import AgentRoleBinding, Role, RoleMember
 
 
 class PermissionsStore:
@@ -52,6 +52,52 @@ class PermissionsStore:
 
 def _is_admin_role(role: dict[str, Any]) -> bool:
     return role.get("name", "").strip().lower() in {"admin", "admins"}
+
+
+def _configured_bootstrap_admin_ids() -> set[str]:
+    raw = os.environ.get("AGENT_MGMT_BOOTSTRAP_ADMIN_OBJECT_IDS", "")
+    return {item.strip().lower() for item in raw.replace(";", ",").split(",") if item.strip()}
+
+
+def _bootstrap_admin_match(user_object_id: str, group_ids: list[str]) -> tuple[str, str] | None:
+    configured_ids = _configured_bootstrap_admin_ids()
+    if not configured_ids:
+        return None
+    user_id = user_object_id.strip().lower()
+    if user_id and user_id in configured_ids:
+        return user_object_id, "user"
+    for group_id in group_ids:
+        if group_id.strip().lower() in configured_ids:
+            return group_id, "group"
+    return None
+
+
+def _ensure_bootstrap_admin_role(
+    roles: list[dict[str, Any]],
+    user_object_id: str,
+    group_ids: list[str],
+    save_role,
+) -> list[dict[str, Any]]:
+    match = _bootstrap_admin_match(user_object_id, group_ids)
+    if match is None:
+        return roles
+
+    object_id, member_type = match
+    admin_role_index = next((index for index, role in enumerate(roles) if _is_admin_role(role)), None)
+    member = RoleMember(object_id=object_id, display_name="Bootstrap admin", member_type=member_type)
+
+    if admin_role_index is None:
+        saved = save_role(Role(name="Admin", description="Bootstrap administrator role.", members=[member]))
+        return [*roles, saved.model_dump(mode="json")]
+
+    role = Role.model_validate(roles[admin_role_index])
+    if any(existing.object_id.lower() == object_id.lower() for existing in role.members):
+        return roles
+    role.members.append(member)
+    saved = save_role(role)
+    updated_roles = [*roles]
+    updated_roles[admin_role_index] = saved.model_dump(mode="json")
+    return updated_roles
 
 
 class CosmosPermissionsStore(PermissionsStore):
@@ -123,6 +169,7 @@ class CosmosPermissionsStore(PermissionsStore):
     def get_agents_for_user(self, user_object_id: str, group_ids: list[str]) -> list[dict[str, Any]]:
         """Return agent bindings where the user or any of their groups is a member of an assigned role."""
         roles = self.list_roles()
+        roles = _ensure_bootstrap_admin_role(roles, user_object_id, group_ids, self.save_role)
         all_member_ids = {user_object_id} | set(group_ids)
 
         # Find which role IDs this user belongs to
@@ -206,6 +253,7 @@ class LocalPermissionsStore(PermissionsStore):
 
     def get_agents_for_user(self, user_object_id: str, group_ids: list[str]) -> list[dict[str, Any]]:
         roles = self.list_roles()
+        roles = _ensure_bootstrap_admin_role(roles, user_object_id, group_ids, self.save_role)
         all_member_ids = {user_object_id} | set(group_ids)
         user_role_ids: set[str] = set()
         is_admin = False

@@ -55,8 +55,8 @@ Build and push the runtime image once, then keep `HOSTED_AGENT_IMAGE` pointed at
 
 ```powershell
 cd agent_management\hosted_agent_runtime
-docker build --platform linux/amd64 -t <your-acr>.azurecr.io/hosted-agent-runtime:latest .
-docker push <your-acr>.azurecr.io/hosted-agent-runtime:latest
+docker build --platform linux/amd64 -t <your-acr>.azurecr.io/hosted-agent-runtime:v8 .
+docker push <your-acr>.azurecr.io/hosted-agent-runtime:v8
 ```
 
 At deployment time, the project ID and Cosmos settings are passed to Foundry so the hosted agent loads its project definition directly from Azure Cosmos DB.

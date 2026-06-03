@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -106,6 +107,63 @@ def _perms():
         return None
 
 
+def _configured_bootstrap_admin_ids() -> set[str]:
+    raw = os.environ.get("AGENT_MGMT_BOOTSTRAP_ADMIN_OBJECT_IDS", "")
+    return {item.strip().lower() for item in raw.replace(";", ",").split(",") if item.strip()}
+
+
+def _bootstrap_admin_match(user_object_id: str, group_ids: list[str]) -> tuple[str, str] | None:
+    configured_ids = _configured_bootstrap_admin_ids()
+    if not configured_ids:
+        return None
+    user_id = user_object_id.strip().lower()
+    if user_id and user_id in configured_ids:
+        return user_object_id, "user"
+    for group_id in group_ids:
+        if group_id.strip().lower() in configured_ids:
+            return group_id, "group"
+    return None
+
+
+def _ensure_bootstrap_admin_role(container, roles: list[dict[str, Any]], user_object_id: str, group_ids: list[str]) -> list[dict[str, Any]]:
+    match = _bootstrap_admin_match(user_object_id, group_ids)
+    if match is None:
+        return roles
+
+    object_id, member_type = match
+    admin_index = next((index for index, role in enumerate(roles) if role.get("name", "").strip().lower() in {"admin", "admins"}), None)
+    member = {"object_id": object_id, "display_name": "Bootstrap admin", "member_type": member_type}
+    now = datetime.now(timezone.utc).isoformat()
+    partition_field = os.environ.get("AGENT_MGMT_PERMISSIONS_PARTITION_KEY", "/roleid").strip("/") or "roleid"
+
+    if admin_index is None:
+        role = {
+            "id": str(uuid.uuid4()),
+            "type": "role",
+            "name": "Admin",
+            "description": "Bootstrap administrator role.",
+            "members": [member],
+            "created_at": now,
+            "updated_at": now,
+        }
+        role[partition_field] = role["id"]
+        container.upsert_item(role)
+        return [*roles, role]
+
+    role = dict(roles[admin_index])
+    members = list(role.get("members", []))
+    if any(existing.get("object_id", "").lower() == object_id.lower() for existing in members):
+        return roles
+    members.append(member)
+    role["members"] = members
+    role["updated_at"] = now
+    role[partition_field] = role["id"]
+    container.upsert_item(role)
+    updated_roles = [*roles]
+    updated_roles[admin_index] = role
+    return updated_roles
+
+
 def _get_agents_for_user(user_object_id: str, group_ids: list[str]) -> list[dict[str, Any]]:
     """Query Cosmos for agent bindings accessible by this user."""
     container = _perms()
@@ -117,6 +175,7 @@ def _get_agents_for_user(user_object_id: str, group_ids: list[str]) -> list[dict
         query="SELECT * FROM c WHERE c.type = 'role'",
         enable_cross_partition_query=True,
     ))
+    roles = _ensure_bootstrap_admin_role(container, roles, user_object_id, group_ids)
 
     all_member_ids = {user_object_id} | set(group_ids)
     user_role_ids: set[str] = set()

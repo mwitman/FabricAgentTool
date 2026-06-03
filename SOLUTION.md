@@ -185,6 +185,8 @@ Agent role binding documents use:
 
 The custom UX no longer uses hardcoded `FOUNDRY_*_AGENT` environment variables for agent visibility. Cosmos role bindings are the source of truth.
 
+For first-time setup, `AGENT_MGMT_BOOTSTRAP_ADMIN_OBJECT_IDS` can contain a comma-separated list of Entra user or group object IDs. When a matching user signs in, the backend treats them as an Admin and creates or updates the Cosmos `Admin` role with that user or group as a member.
+
 ## Deployment Modes
 
 ### Standalone Agent
@@ -292,9 +294,10 @@ MAF_MGMT_PROJECT_ID
 ### Permissions Cosmos DB
 
 ```text
-PERMISSIONS_COSMOS_ENDPOINT
-PERMISSIONS_COSMOS_DATABASE
-PERMISSIONS_COSMOS_CONTAINER
+AGENT_MGMT_PERMISSIONS_DATABASE
+AGENT_MGMT_PERMISSIONS_CONTAINER
+AGENT_MGMT_PERMISSIONS_PARTITION_KEY
+AGENT_MGMT_BOOTSTRAP_ADMIN_OBJECT_IDS
 ```
 
 ### Fabric and Power BI
@@ -349,7 +352,7 @@ Push-Location agent_management\hosted_agent_runtime
 az acr build `
   --registry adventureworksacr `
   --image hosted-agent-runtime:latest `
-  --image hosted-agent-runtime:v6 `
+  --image hosted-agent-runtime:v8 `
   . `
   --no-logs
 ```
@@ -357,8 +360,8 @@ az acr build `
 The most recent validated image from this solution work is:
 
 ```text
-adventureworksacr.azurecr.io/hosted-agent-runtime:v6
-sha256:1fd3a1d3c55eee5a6e306c762b22a1bfd0401c04734d2a0bcaba12c2f9e22c10
+adventureworksacr.azurecr.io/hosted-agent-runtime:v8
+sha256:2cefe9f3da7272e9c08c6672da873e157c7a5368effaaf48a3b75b76e66f4e79
 ```
 
 Use the versioned tag when updating Foundry Hosted Agents. Foundry can cache `latest`, so a versioned tag is the safer cache-busting deployment target.

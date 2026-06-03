@@ -706,7 +706,7 @@ async def responses(request: Request):
         error_text = "A Fabric bearer token is required. The custom UX supplies this token, but the Foundry playground does not."
         if body.get("stream") is True:
             return StreamingResponse(_stream_sse(error_text, conversation_id), media_type="text/event-stream")
-        return _error_response(error_text, conversation_id)
+        return _responses_payload(error_text, conversation_id, project)
 
     if body.get("stream") is True:
         return StreamingResponse(
