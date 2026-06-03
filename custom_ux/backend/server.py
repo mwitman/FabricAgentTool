@@ -99,6 +99,8 @@ def _perms():
         db = client.get_database_client(database_name)
         container = db.get_container_client(container_name)
         container.read()  # verify access
+        roles = list(container.query_items(query="SELECT * FROM c WHERE c.type = 'role'", enable_cross_partition_query=True))
+        _ensure_configured_admin_role(container, roles)
         _permissions_store = container
         return _permissions_store
     except Exception as exc:
@@ -110,6 +112,19 @@ def _perms():
 def _configured_bootstrap_admin_ids() -> set[str]:
     raw = os.environ.get("AGENT_MGMT_BOOTSTRAP_ADMIN_OBJECT_IDS", "")
     return {item.strip().lower() for item in raw.replace(";", ",").split(",") if item.strip()}
+
+
+def _configured_bootstrap_admin_members() -> list[dict[str, str]]:
+    raw = os.environ.get("AGENT_MGMT_BOOTSTRAP_ADMIN_OBJECT_IDS", "")
+    members: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw.replace(";", ",").split(","):
+        object_id = item.strip()
+        if not object_id or object_id.lower() in seen:
+            continue
+        seen.add(object_id.lower())
+        members.append({"object_id": object_id, "display_name": "Bootstrap admin", "member_type": "user"})
+    return members
 
 
 def _bootstrap_admin_match(user_object_id: str, group_ids: list[str]) -> tuple[str, str] | None:
@@ -126,6 +141,7 @@ def _bootstrap_admin_match(user_object_id: str, group_ids: list[str]) -> tuple[s
 
 
 def _ensure_bootstrap_admin_role(container, roles: list[dict[str, Any]], user_object_id: str, group_ids: list[str]) -> list[dict[str, Any]]:
+    roles = _ensure_configured_admin_role(container, roles)
     match = _bootstrap_admin_match(user_object_id, group_ids)
     if match is None:
         return roles
@@ -155,6 +171,50 @@ def _ensure_bootstrap_admin_role(container, roles: list[dict[str, Any]], user_ob
     if any(existing.get("object_id", "").lower() == object_id.lower() for existing in members):
         return roles
     members.append(member)
+    role["members"] = members
+    role["updated_at"] = now
+    role[partition_field] = role["id"]
+    container.upsert_item(role)
+    updated_roles = [*roles]
+    updated_roles[admin_index] = role
+    return updated_roles
+
+
+def _ensure_configured_admin_role(container, roles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    configured_members = _configured_bootstrap_admin_members()
+    if not configured_members:
+        return roles
+
+    admin_index = next((index for index, role in enumerate(roles) if role.get("name", "").strip().lower() in {"admin", "admins"}), None)
+    now = datetime.now(timezone.utc).isoformat()
+    partition_field = os.environ.get("AGENT_MGMT_PERMISSIONS_PARTITION_KEY", "/roleid").strip("/") or "roleid"
+
+    if admin_index is None:
+        role = {
+            "id": str(uuid.uuid4()),
+            "type": "role",
+            "name": "Admin",
+            "description": "Bootstrap administrator role.",
+            "members": configured_members,
+            "created_at": now,
+            "updated_at": now,
+        }
+        role[partition_field] = role["id"]
+        container.upsert_item(role)
+        return [*roles, role]
+
+    role = dict(roles[admin_index])
+    members = list(role.get("members", []))
+    existing_ids = {member.get("object_id", "").lower() for member in members}
+    changed = False
+    for member in configured_members:
+        if member["object_id"].lower() not in existing_ids:
+            members.append(member)
+            existing_ids.add(member["object_id"].lower())
+            changed = True
+    if not changed:
+        return roles
+
     role["members"] = members
     role["updated_at"] = now
     role[partition_field] = role["id"]

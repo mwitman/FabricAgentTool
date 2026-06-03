@@ -32,6 +32,9 @@ class PermissionsStore:
     def delete_role(self, role_id: str) -> None:
         raise NotImplementedError
 
+    def bootstrap_admin_role(self) -> None:
+        raise NotImplementedError
+
     # -- Agent role bindings --
     def list_agent_bindings(self) -> list[dict[str, Any]]:
         raise NotImplementedError
@@ -59,6 +62,19 @@ def _configured_bootstrap_admin_ids() -> set[str]:
     return {item.strip().lower() for item in raw.replace(";", ",").split(",") if item.strip()}
 
 
+def _configured_bootstrap_admin_members() -> list[RoleMember]:
+    raw = os.environ.get("AGENT_MGMT_BOOTSTRAP_ADMIN_OBJECT_IDS", "")
+    members: list[RoleMember] = []
+    seen: set[str] = set()
+    for item in raw.replace(";", ",").split(","):
+        object_id = item.strip()
+        if not object_id or object_id.lower() in seen:
+            continue
+        seen.add(object_id.lower())
+        members.append(RoleMember(object_id=object_id, display_name="Bootstrap admin", member_type="user"))
+    return members
+
+
 def _bootstrap_admin_match(user_object_id: str, group_ids: list[str]) -> tuple[str, str] | None:
     configured_ids = _configured_bootstrap_admin_ids()
     if not configured_ids:
@@ -78,6 +94,7 @@ def _ensure_bootstrap_admin_role(
     group_ids: list[str],
     save_role,
 ) -> list[dict[str, Any]]:
+    roles = _ensure_configured_admin_role(roles, save_role)
     match = _bootstrap_admin_match(user_object_id, group_ids)
     if match is None:
         return roles
@@ -94,6 +111,33 @@ def _ensure_bootstrap_admin_role(
     if any(existing.object_id.lower() == object_id.lower() for existing in role.members):
         return roles
     role.members.append(member)
+    saved = save_role(role)
+    updated_roles = [*roles]
+    updated_roles[admin_role_index] = saved.model_dump(mode="json")
+    return updated_roles
+
+
+def _ensure_configured_admin_role(roles: list[dict[str, Any]], save_role) -> list[dict[str, Any]]:
+    configured_members = _configured_bootstrap_admin_members()
+    if not configured_members:
+        return roles
+
+    admin_role_index = next((index for index, role in enumerate(roles) if _is_admin_role(role)), None)
+    if admin_role_index is None:
+        saved = save_role(Role(name="Admin", description="Bootstrap administrator role.", members=configured_members))
+        return [*roles, saved.model_dump(mode="json")]
+
+    role = Role.model_validate(roles[admin_role_index])
+    existing_ids = {member.object_id.lower() for member in role.members}
+    changed = False
+    for member in configured_members:
+        if member.object_id.lower() not in existing_ids:
+            role.members.append(member)
+            existing_ids.add(member.object_id.lower())
+            changed = True
+    if not changed:
+        return roles
+
     saved = save_role(role)
     updated_roles = [*roles]
     updated_roles[admin_role_index] = saved.model_dump(mode="json")
@@ -131,6 +175,9 @@ class CosmosPermissionsStore(PermissionsStore):
         item = role.model_dump(mode="json")
         self._save_item(item)
         return role
+
+    def bootstrap_admin_role(self) -> None:
+        _ensure_configured_admin_role(self.list_roles(), self.save_role)
 
     def delete_role(self, role_id: str) -> None:
         self.container.delete_item(item=role_id, partition_key=role_id)
@@ -222,6 +269,9 @@ class LocalPermissionsStore(PermissionsStore):
         path.write_text(role.model_dump_json(indent=2), encoding="utf-8")
         return role
 
+    def bootstrap_admin_role(self) -> None:
+        _ensure_configured_admin_role(self.list_roles(), self.save_role)
+
     def delete_role(self, role_id: str) -> None:
         path = self.root / f"role_{role_id}.json"
         if path.exists():
@@ -276,11 +326,15 @@ def create_permissions_store() -> PermissionsStore:
     """Create a permissions store, preferring Cosmos, falling back to local if allowed."""
     allow_local = os.environ.get("AGENT_MGMT_ALLOW_LOCAL_STORE", "false").lower() == "true"
     try:
-        return CosmosPermissionsStore()
+        permissions_store = CosmosPermissionsStore()
+        permissions_store.bootstrap_admin_role()
+        return permissions_store
     except Exception as exc:
         if allow_local:
             print(f"[permissions_store] Cosmos Permissions container unavailable ({type(exc).__name__}), using local file store.")
-            return LocalPermissionsStore()
+            permissions_store = LocalPermissionsStore()
+            permissions_store.bootstrap_admin_role()
+            return permissions_store
         raise
 
 

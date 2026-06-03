@@ -185,7 +185,7 @@ Agent role binding documents use:
 
 The custom UX no longer uses hardcoded `FOUNDRY_*_AGENT` environment variables for agent visibility. Cosmos role bindings are the source of truth.
 
-For first-time setup, `AGENT_MGMT_BOOTSTRAP_ADMIN_OBJECT_IDS` can contain a comma-separated list of Entra user or group object IDs. When a matching user signs in, the backend treats them as an Admin and creates or updates the Cosmos `Admin` role with that user or group as a member.
+For first-time setup, `AGENT_MGMT_BOOTSTRAP_ADMIN_OBJECT_IDS` can contain a comma-separated list of Entra user or group object IDs. When the permissions store connects, the backend creates the Cosmos `Admin` role if it does not exist and adds those configured object IDs as members. Matching users or members of matching groups are treated as Admins during role filtering.
 
 ## Deployment Modes
 
