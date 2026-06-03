@@ -1,0 +1,182 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.43.8.12551",
+      "templateHash": "10987223885730712120"
+    }
+  },
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region for Agent Management resources."
+      }
+    },
+    "containerAppsEnvironmentName": {
+      "type": "string",
+      "defaultValue": "agent-mgmt-env",
+      "metadata": {
+        "description": "Container Apps environment name."
+      }
+    },
+    "containerAppName": {
+      "type": "string",
+      "defaultValue": "agent-management",
+      "metadata": {
+        "description": "Agent Management Container App name."
+      }
+    },
+    "image": {
+      "type": "string",
+      "metadata": {
+        "description": "Container image for the Agent Management app."
+      }
+    },
+    "acrLoginServer": {
+      "type": "string",
+      "metadata": {
+        "description": "Azure Container Registry login server."
+      }
+    },
+    "agentMgmtCosmosEndpoint": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Azure Cosmos DB endpoint used by project storage."
+      }
+    },
+    "appClientSecret": {
+      "type": "securestring",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional app client secret for Foundry/Azure OpenAI access when managed identity is not used."
+      }
+    },
+    "azureTenantId": {
+      "type": "string",
+      "defaultValue": "72d0cd1a-069b-4eb6-b11f-76cb157bb7b8",
+      "metadata": {
+        "description": "Entra tenant ID."
+      }
+    },
+    "appClientId": {
+      "type": "string",
+      "metadata": {
+        "description": "Application client ID used by backend and frontend."
+      }
+    },
+    "aoaiDeploymentName": {
+      "type": "string",
+      "defaultValue": "gpt-5.4",
+      "metadata": {
+        "description": "Azure OpenAI deployment name used for prompt generation."
+      }
+    },
+    "foundryProjectEndpoint": {
+      "type": "string",
+      "metadata": {
+        "description": "Foundry project endpoint used for hosted-agent deployment."
+      }
+    },
+    "hostedAgentImage": {
+      "type": "string",
+      "defaultValue": "[format('{0}/hosted-agent-runtime:latest', parameters('acrLoginServer'))]",
+      "metadata": {
+        "description": "Reusable runtime image used for generated Foundry Hosted Agents."
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.OperationalInsights/workspaces",
+      "apiVersion": "2025-02-01",
+      "name": "[format('{0}-logs', parameters('containerAppName'))]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "sku": {
+          "name": "PerGB2018"
+        },
+        "retentionInDays": 30
+      }
+    },
+    {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2025-02-02-preview",
+      "name": "[parameters('containerAppsEnvironmentName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "appLogsConfiguration": {
+          "destination": "log-analytics",
+          "logAnalyticsConfiguration": {
+            "customerId": "[reference(resourceId('Microsoft.OperationalInsights/workspaces', format('{0}-logs', parameters('containerAppName'))), '2025-02-01').customerId]",
+            "sharedKey": "[listKeys(resourceId('Microsoft.OperationalInsights/workspaces', format('{0}-logs', parameters('containerAppName'))), '2025-02-01').primarySharedKey]"
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.OperationalInsights/workspaces', format('{0}-logs', parameters('containerAppName')))]"
+      ]
+    },
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2025-02-02-preview",
+      "name": "[parameters('containerAppName')]",
+      "location": "[parameters('location')]",
+      "identity": {
+        "type": "SystemAssigned"
+      },
+      "properties": {
+        "managedEnvironmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('containerAppsEnvironmentName'))]",
+        "configuration": {
+          "activeRevisionsMode": "Single",
+          "ingress": {
+            "external": true,
+            "targetPort": 8091,
+            "transport": "auto"
+          },
+          "registries": [
+            {
+              "server": "[parameters('acrLoginServer')]",
+              "identity": "system"
+            }
+          ],
+          "secrets": "[if(empty(parameters('appClientSecret')), createArray(), createArray(createObject('name', 'app-client-secret', 'value', parameters('appClientSecret'))))]"
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "agent-mgmt",
+              "image": "[parameters('image')]",
+              "env": "[concat(createArray(createObject('name', 'PORT', 'value', '8091'), createObject('name', 'AGENT_MGMT_COSMOS_ENDPOINT', 'value', parameters('agentMgmtCosmosEndpoint')), createObject('name', 'AGENT_MGMT_COSMOS_DATABASE', 'value', 'agents'), createObject('name', 'AGENT_MGMT_COSMOS_CONTAINER', 'value', 'agentmetadata'), createObject('name', 'AGENT_MGMT_COSMOS_PARTITION_KEY', 'value', '/projectid'), createObject('name', 'AGENT_MGMT_PERMISSIONS_DATABASE', 'value', 'permissions'), createObject('name', 'AGENT_MGMT_PERMISSIONS_CONTAINER', 'value', 'roles'), createObject('name', 'AGENT_MGMT_PERMISSIONS_PARTITION_KEY', 'value', '/roleid'), createObject('name', 'AGENT_MGMT_COSMOS_CREATE_IF_MISSING', 'value', 'false'), createObject('name', 'AGENT_MGMT_COSMOS_AUTH_MODE', 'value', 'service_principal'), createObject('name', 'AZURE_TENANT_ID', 'value', parameters('azureTenantId')), createObject('name', 'APP_CLIENT_ID', 'value', parameters('appClientId')), createObject('name', 'AZURE_OPENAI_DEPLOYMENT_NAME', 'value', parameters('aoaiDeploymentName')), createObject('name', 'AZURE_OPENAI_API_VERSION', 'value', 'preview'), createObject('name', 'FOUNDRY_PROJECT_ENDPOINT', 'value', parameters('foundryProjectEndpoint')), createObject('name', 'FOUNDRY_API_VERSION', 'value', 'v1'), createObject('name', 'FOUNDRY_FEATURES', 'value', 'HostedAgents=V1Preview'), createObject('name', 'ACR_LOGIN_SERVER', 'value', parameters('acrLoginServer')), createObject('name', 'HOSTED_AGENT_IMAGE', 'value', parameters('hostedAgentImage'))), if(empty(parameters('appClientSecret')), createArray(), createArray(createObject('name', 'APP_CLIENT_SECRET', 'secretRef', 'app-client-secret'))))]",
+              "resources": {
+                "cpu": "[json('0.5')]",
+                "memory": "1Gi"
+              }
+            }
+          ],
+          "scale": {
+            "minReplicas": 1,
+            "maxReplicas": 3
+          }
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.App/managedEnvironments', parameters('containerAppsEnvironmentName'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "url": {
+      "type": "string",
+      "value": "[format('https://{0}', reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2025-02-02-preview').configuration.ingress.fqdn)]"
+    },
+    "principalId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.App/containerApps', parameters('containerAppName')), '2025-02-02-preview', 'full').identity.principalId]"
+    }
+  }
+}

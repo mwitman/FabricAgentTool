@@ -1,0 +1,556 @@
+"""Custom UX Backend — FastAPI server with SSO that proxies requests to Foundry Hosted Agents.
+
+Exposes:
+    POST /api/chat          — SSE stream (proxied from Foundry Hosted Agents)
+    DELETE /api/chat/{id}   — delete a conversation thread
+    GET  /api/health        — healthcheck
+    GET  /                  — serves the built React frontend (static files)
+
+Authentication:
+    The frontend acquires a Fabric-scoped access token via MSAL.js and sends it
+    as ``Authorization: Bearer <token>``. For Foundry Hosted Agents, the backend
+    uses its own Azure credential to call Foundry and passes the Fabric token in
+    the request body so tools can call Fabric GraphQL as the signed-in user.
+
+Configuration:
+    FOUNDRY_PROJECT_ENDPOINT — Foundry project endpoint ending in /api/projects/<project>.
+"""
+
+import json
+import os
+import sys
+import uuid
+from pathlib import Path
+from typing import Any
+
+import aiohttp
+import uvicorn
+from azure.identity import ClientSecretCredential, DefaultAzureCredential
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+# ---------------------------------------------------------------------------
+# Path & env setup
+# ---------------------------------------------------------------------------
+_backend_dir = Path(__file__).resolve().parent
+_custom_ux_dir = _backend_dir.parent
+load_dotenv(_custom_ux_dir / ".env")
+
+# ---------------------------------------------------------------------------
+# Mem0 memory layer (optional — stays in the UX layer for cross-session recall)
+# ---------------------------------------------------------------------------
+sys.path.insert(0, str(_backend_dir))
+from memory import create_memory  # noqa: E402
+
+import logging as _logging
+_mem0_logger = _logging.getLogger("mem0")
+try:
+    memory = create_memory()
+    _mem0_logger.info("Mem0 memory layer initialised")
+except Exception as _e:
+    _mem0_logger.warning("Mem0 unavailable — running without memory: %s", _e)
+    memory = None
+
+# ---------------------------------------------------------------------------
+# Foundry Hosted Agent routing
+# ---------------------------------------------------------------------------
+FOUNDRY_PROJECT_ENDPOINT = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "").rstrip("/")
+FOUNDRY_API_VERSION = os.environ.get("FOUNDRY_API_VERSION", "v1")
+FOUNDRY_FEATURES = os.environ.get("FOUNDRY_FEATURES", "HostedAgents=V1Preview")
+
+_azure_credential: DefaultAzureCredential | None = None
+_conversation_history: dict[str, list[dict[str, str]]] = {}
+_history_turn_limit = 8
+
+
+# ---------------------------------------------------------------------------
+# Permissions store (Cosmos) — determines which agents a user can see
+# ---------------------------------------------------------------------------
+_permissions_store = None
+
+
+def _cosmos_credential():
+    tenant_id = os.environ.get("AZURE_TENANT_ID")
+    client_id = os.environ.get("APP_CLIENT_ID") or os.environ.get("AZURE_CLIENT_ID")
+    client_secret = os.environ.get("APP_CLIENT_SECRET") or os.environ.get("AZURE_CLIENT_SECRET")
+    if tenant_id and client_id and client_secret:
+        return ClientSecretCredential(tenant_id, client_id, client_secret)
+    return DefaultAzureCredential(exclude_interactive_browser_credential=True)
+
+
+def _perms():
+    """Lazily create a Cosmos-backed permissions store."""
+    global _permissions_store
+    if _permissions_store is not None:
+        return _permissions_store
+
+    from azure.cosmos import CosmosClient
+    endpoint = os.environ.get("AGENT_MGMT_COSMOS_ENDPOINT", "").strip()
+    if not endpoint:
+        return None
+    database_name = os.environ.get("AGENT_MGMT_PERMISSIONS_DATABASE", "permissions")
+    container_name = os.environ.get("AGENT_MGMT_PERMISSIONS_CONTAINER", "roles")
+    try:
+        client = CosmosClient(endpoint, credential=_cosmos_credential())
+        db = client.get_database_client(database_name)
+        container = db.get_container_client(container_name)
+        container.read()  # verify access
+        _permissions_store = container
+        return _permissions_store
+    except Exception as exc:
+        import logging
+        logging.getLogger("custom_ux").warning("Permissions store unavailable: %s", exc)
+        return None
+
+
+def _get_agents_for_user(user_object_id: str, group_ids: list[str]) -> list[dict[str, Any]]:
+    """Query Cosmos for agent bindings accessible by this user."""
+    container = _perms()
+    if container is None:
+        return []
+
+    # Load all roles
+    roles = list(container.query_items(
+        query="SELECT * FROM c WHERE c.type = 'role'",
+        enable_cross_partition_query=True,
+    ))
+
+    all_member_ids = {user_object_id} | set(group_ids)
+    user_role_ids: set[str] = set()
+    is_admin = False
+    for role in roles:
+        for member in role.get("members", []):
+            if member.get("object_id") in all_member_ids:
+                user_role_ids.add(role["id"])
+                if role.get("name", "").strip().lower() in {"admin", "admins"}:
+                    is_admin = True
+                break
+
+    # Load all agent bindings
+    bindings = list(container.query_items(
+        query="SELECT * FROM c WHERE c.type = 'agent_role_binding'",
+        enable_cross_partition_query=True,
+    ))
+
+    if is_admin:
+        return bindings
+    if not user_role_ids:
+        return []
+
+    return [b for b in bindings if set(b.get("role_ids", [])) & user_role_ids]
+
+
+def _get_all_agent_bindings() -> list[dict[str, Any]]:
+    """Return all agent bindings (no role filtering)."""
+    container = _perms()
+    if container is None:
+        return []
+    return list(container.query_items(
+        query="SELECT * FROM c WHERE c.type = 'agent_role_binding'",
+        enable_cross_partition_query=True,
+    ))
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+app = FastAPI(title="Fabric GraphQL Agents - Custom UX")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------------------------------------------------------------------------
+# SSE helpers
+# ---------------------------------------------------------------------------
+def _sse(data: dict) -> str:
+    return f"data: {json.dumps(data)}\n\n"
+
+
+def _normalize_agent(agent: str) -> str:
+    value = (agent or "orchestrator").strip().lower()
+    if value in _agent_names():
+        return value
+    return AGENT_ALIASES.get(value, "orchestrator")
+
+
+# ---------------------------------------------------------------------------
+# Agent resolution — dynamic from Cosmos bindings
+# ---------------------------------------------------------------------------
+def _normalize_agent(agent: str) -> str:
+    """Return the agent_name as-is (it's now a Foundry agent name from Cosmos)."""
+    return (agent or "").strip()
+
+
+def _foundry_responses_url(agent_name: str) -> str:
+    if not FOUNDRY_PROJECT_ENDPOINT:
+        raise RuntimeError("FOUNDRY_PROJECT_ENDPOINT is required.")
+    return (
+        f"{FOUNDRY_PROJECT_ENDPOINT}/agents/{agent_name}"
+        f"/endpoint/protocols/openai/responses?api-version={FOUNDRY_API_VERSION}"
+    )
+
+
+def _format_history_context(conversation_id: str) -> str:
+    history = _conversation_history.get(conversation_id, [])[-(_history_turn_limit * 2):]
+    if not history:
+        return ""
+
+    lines = []
+    for message in history:
+        role = message.get("role", "message").title()
+        content = message.get("content", "").strip()
+        if content:
+            lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+def _append_history(conversation_id: str, user_message: str, assistant_message: str) -> None:
+    history = _conversation_history.setdefault(conversation_id, [])
+    history.extend(
+        [
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": assistant_message},
+        ]
+    )
+    max_messages = _history_turn_limit * 2
+    if len(history) > max_messages:
+        del history[:-max_messages]
+
+
+def _azure_ai_access_token() -> str:
+    static_token = os.environ.get("FOUNDRY_ACCESS_TOKEN", "").strip()
+    if static_token:
+        return static_token.removeprefix("Bearer ").strip()
+
+    global _azure_credential
+    if _azure_credential is None:
+        tenant_id = os.environ.get("AZURE_TENANT_ID")
+        client_id = os.environ.get("APP_CLIENT_ID") or os.environ.get("AZURE_CLIENT_ID")
+        client_secret = os.environ.get("APP_CLIENT_SECRET") or os.environ.get("AZURE_CLIENT_SECRET")
+        if tenant_id and client_id and client_secret:
+            _azure_credential = ClientSecretCredential(tenant_id, client_id, client_secret)
+        else:
+            _azure_credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
+    return _azure_credential.get_token("https://ai.azure.com/.default").token
+
+
+def _parse_sse_block(block: str) -> tuple[str | None, dict | str | None]:
+    event_type: str | None = None
+    data_lines: list[str] = []
+
+    for raw_line in block.splitlines():
+        line = raw_line.strip()
+        if line.startswith("event:"):
+            event_type = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:"):].strip())
+
+    if not data_lines:
+        return event_type, None
+
+    data = "\n".join(data_lines)
+    if data == "[DONE]":
+        return event_type or "done", "[DONE]"
+
+    try:
+        return event_type, json.loads(data)
+    except json.JSONDecodeError:
+        return event_type, data
+
+
+def _foundry_event_to_ux(event_type: str | None, payload: dict | str | None) -> dict | None:
+    if payload == "[DONE]":
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    payload_type = payload.get("type") or event_type
+    if payload_type == "response.output_text.delta":
+        return {"type": "text", "content": payload.get("delta", "")}
+    if payload_type == "response.failed":
+        response = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+        error = response.get("error") if isinstance(response.get("error"), dict) else {}
+        return {"type": "error", "content": error.get("message") or "Foundry hosted agent failed."}
+    if payload_type == "error":
+        return {"type": "error", "content": payload.get("message") or payload.get("error") or "Foundry error."}
+
+    return None
+
+
+async def _proxy_foundry_agent(
+    fabric_token: str,
+    powerbi_token: str | None,
+    enriched_message: str,
+    conversation_id: str,
+    agent: str,
+    full_response: list[str],
+):
+    token = _azure_ai_access_token()
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=300)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            _foundry_responses_url(agent),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Foundry-Features": FOUNDRY_FEATURES,
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+            },
+            json={
+                "input": enriched_message,
+                "conversation_id": conversation_id,
+                "stream": True,
+                "fabric_token": fabric_token,
+                "powerbi_token": powerbi_token,
+            },
+        ) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                yield _sse({"type": "error", "content": f"Foundry agent error ({resp.status}): {error_text}"})
+                return
+
+            buffer = ""
+            async for chunk in resp.content.iter_any():
+                buffer += chunk.decode("utf-8")
+                blocks = buffer.split("\n\n")
+                buffer = blocks.pop()
+
+                for block in blocks:
+                    event_type, payload = _parse_sse_block(block)
+                    ux_event = _foundry_event_to_ux(event_type, payload)
+                    if not ux_event:
+                        continue
+                    if ux_event.get("type") == "text":
+                        full_response.append(ux_event.get("content", ""))
+                    yield _sse(ux_event)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/chat — SSE streaming (proxied to Foundry Hosted Agents)
+# ---------------------------------------------------------------------------
+@app.post("/api/chat")
+async def chat(request: Request):
+    # --- Extract the Fabric bearer token from the Authorization header ---
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return JSONResponse(
+            {"error": "Missing or invalid Authorization header. A Fabric-scoped Bearer token is required."},
+            status_code=401,
+        )
+    fabric_token = auth_header[len("Bearer "):]
+
+    body = await request.json()
+    message: str = body.get("message", "")
+    conversation_id: str = body.get("conversation_id") or str(uuid.uuid4())
+    user_id: str = body.get("user_id") or "default_user"
+    agent: str = _normalize_agent(body.get("agent", ""))
+    powerbi_token: str | None = body.get("powerbi_token") or body.get("powerbiToken")
+
+    if not message.strip():
+        return JSONResponse({"error": "message is required"}, status_code=400)
+    if not agent:
+        return JSONResponse({"error": "agent is required (pass the agent_name from Cosmos)"}, status_code=400)
+
+    # --- Retrieve conversation and long-term memory context ---
+    enriched_message = message
+    context_blocks: list[str] = []
+
+    history_context = _format_history_context(conversation_id)
+    if history_context:
+        context_blocks.append(f"[Conversation so far]\n{history_context}")
+
+    if memory:
+        try:
+            results = memory.search(query=message, filters={"user_id": user_id}, limit=5)
+            memories_list = results.get("results", []) if isinstance(results, dict) else results
+            if memories_list:
+                mem_lines = "\n".join(f"- {m['memory']}" for m in memories_list)
+                context_blocks.append(f"[Relevant context from previous conversations]\n{mem_lines}")
+        except Exception as exc:
+            _mem0_logger.warning("Mem0 search failed: %s", exc)
+
+    if context_blocks:
+        enriched_message = f"{'\n\n'.join(context_blocks)}\n\n[Current user message]\n{message}"
+
+    # --- Proxy to Foundry Hosted Agent (SSE streaming) ---
+    async def event_stream():
+        yield _sse({"type": "meta", "conversation_id": conversation_id, "agent": agent})
+
+        full_response: list[str] = []
+        try:
+            async for event in _proxy_foundry_agent(
+                fabric_token=fabric_token,
+                powerbi_token=powerbi_token,
+                enriched_message=enriched_message,
+                conversation_id=conversation_id,
+                agent=agent,
+                full_response=full_response,
+            ):
+                yield event
+
+        except Exception as exc:
+            yield _sse({"type": "error", "content": str(exc)})
+
+        yield _sse({"type": "done"})
+
+        # --- Mem0: store the exchange for future recall ---
+        if memory and full_response:
+            try:
+                assistant_message = "".join(full_response)
+                exchange = [
+                    {"role": "user", "content": message},
+                    {"role": "assistant", "content": assistant_message},
+                ]
+                memory.add(exchange, user_id=user_id)
+            except Exception as exc:
+                _mem0_logger.warning("Mem0 add failed: %s", exc)
+
+        if full_response:
+            _append_history(conversation_id, message, "".join(full_response))
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# DELETE /api/chat/{conversation_id}
+# ---------------------------------------------------------------------------
+@app.delete("/api/chat/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    _conversation_history.pop(conversation_id, None)
+    return {"status": "deleted", "conversation_id": conversation_id}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/health
+# ---------------------------------------------------------------------------
+@app.get("/api/health")
+async def health():
+    return {
+        "status": "ok",
+        "service": "custom-ux",
+        "foundry_project_endpoint": FOUNDRY_PROJECT_ENDPOINT,
+        "permissions_store": "connected" if _perms() is not None else "unavailable",
+    }
+
+
+@app.get("/api/agents")
+async def agents_list():
+    """Return all agent bindings (no user filtering). Used for admin views."""
+    bindings = _get_all_agent_bindings()
+    return {"agents": [
+        {
+            "key": b.get("agent_name", ""),
+            "label": b.get("project_display_name") or b.get("agent_name", ""),
+            "agent_name": b.get("agent_name", ""),
+            "icon": "bot",
+        }
+        for b in bindings if b.get("agent_name")
+    ]}
+
+
+@app.post("/api/agents-for-user")
+async def agents_for_user(request: Request):
+    """Return agent options filtered by the user's roles in Cosmos."""
+    body = await request.json()
+    user_object_id = body.get("user_object_id", "")
+    group_ids = body.get("group_ids", [])
+    if not user_object_id:
+        return JSONResponse({"error": "user_object_id is required."}, status_code=400)
+    bindings = _get_agents_for_user(user_object_id, group_ids)
+    return {"agents": [
+        {
+            "key": b.get("agent_name", ""),
+            "label": b.get("project_display_name") or b.get("agent_name", ""),
+            "agent_name": b.get("agent_name", ""),
+            "icon": "bot",
+        }
+        for b in bindings if b.get("agent_name")
+    ]}
+
+
+@app.get("/api/my-agents")
+async def my_agents(request: Request):
+    """Return agents the authenticated user can access, based on their roles.
+
+    Reads the user's OID from the Authorization token (via MS Graph /me),
+    resolves their group memberships, then filters agent bindings by role.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return JSONResponse({"error": "Bearer token required."}, status_code=401)
+    user_token = auth_header[len("Bearer "):]
+
+    # Use the user's token to get their OID from Graph
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            "https://graph.microsoft.com/v1.0/me?$select=id,displayName",
+            headers={"Authorization": f"Bearer {user_token}"},
+        ) as resp:
+            if resp.status != 200:
+                return JSONResponse({"error": "Failed to resolve user identity from Graph."}, status_code=401)
+            me = await resp.json()
+            user_object_id = me.get("id", "")
+
+    if not user_object_id:
+        return JSONResponse({"error": "Could not determine user object ID."}, status_code=401)
+
+    # Resolve group memberships using service principal (transitiveMemberOf)
+    group_ids: list[str] = []
+    try:
+        cred = _cosmos_credential()
+        sp_token = cred.get_token("https://graph.microsoft.com/.default").token
+        headers = {"Authorization": f"Bearer {sp_token}", "ConsistencyLevel": "eventual"}
+        url: str | None = (
+            f"https://graph.microsoft.com/v1.0/users/{user_object_id}"
+            f"/transitiveMemberOf/microsoft.graph.group?$select=id&$top=999"
+        )
+        async with aiohttp.ClientSession() as session:
+            while url:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status != 200:
+                        break
+                    data = await resp.json()
+                    group_ids.extend(g["id"] for g in data.get("value", []) if g.get("id"))
+                    url = data.get("@odata.nextLink")
+    except Exception:
+        pass  # Continue with just the user OID if group resolution fails
+
+    bindings = _get_agents_for_user(user_object_id, group_ids)
+    return {"agents": [
+        {
+            "key": b.get("agent_name", ""),
+            "label": b.get("project_display_name") or b.get("agent_name", ""),
+            "agent_name": b.get("agent_name", ""),
+            "icon": "bot",
+        }
+        for b in bindings if b.get("agent_name")
+    ]}
+
+
+# ---------------------------------------------------------------------------
+# Static file serving (built React frontend)
+# ---------------------------------------------------------------------------
+_static_dir = _backend_dir / "static"
+if _static_dir.exists():
+    @app.get("/")
+    async def root():
+        from fastapi.responses import FileResponse
+        return FileResponse(_static_dir / "index.html")
+
+    app.mount("/", StaticFiles(directory=str(_static_dir)), name="static")
+
+
+# ---------------------------------------------------------------------------
+# Run directly
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8080"))
+    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=True)

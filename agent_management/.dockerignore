@@ -1,0 +1,13 @@
+.env
+frontend/.env
+frontend/.env.local
+frontend/node_modules
+frontend/dist
+backend/static
+backend/data
+backend/generated_agents
+__pycache__
+**/__pycache__
+*.pyc
+_deploy_debug.log
+_test_cosmos_conn.py

@@ -1,0 +1,13 @@
+# Microsoft Agent Framework
+agent-framework-core==1.6.0
+agent-framework-foundry==1.6.0
+agent-framework-openai==1.6.0
+openai>=2.8.0,<3.0.0
+
+# Runtime dependencies
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+azure-cosmos>=4.9.0
+azure-identity>=1.19.0
+python-dotenv>=1.0.1
+aiohttp>=3.11.0
