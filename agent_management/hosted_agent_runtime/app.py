@@ -21,7 +21,7 @@ from urllib.parse import urljoin
 import aiohttp
 import uvicorn
 from azure.cosmos import CosmosClient
-from azure.identity import ClientSecretCredential, DefaultAzureCredential, get_bearer_token_provider
+from azure.identity import ClientSecretCredential, DefaultAzureCredential
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
@@ -54,9 +54,8 @@ except ImportError:
 
 # FoundryChatClient — may live in different submodules
 try:
-    from agent_framework.foundry import AnthropicFoundryClient, FoundryChatClient
+    from agent_framework.foundry import FoundryChatClient
 except ImportError:
-    AnthropicFoundryClient = None  # type: ignore[assignment]
     from agent_framework import FoundryChatClient
 
 load_dotenv()
@@ -111,47 +110,10 @@ def _resolve_model_deployment(model_config: dict[str, Any] | None = None) -> str
     )
 
 
-def _model_config_text(model_config: dict[str, Any] | None = None) -> str:
-    fields = [
-        "deployment_name",
-        "model_display_name",
-        "model_name",
-        "provider",
-        "publisher",
-        "format",
-        "model_format",
-    ]
-    return " ".join(str((model_config or {}).get(field, "")) for field in fields).lower()
-
-
-def _is_anthropic_model(model_config: dict[str, Any] | None = None) -> bool:
-    model_text = _model_config_text(model_config)
-    return "anthropic" in model_text or "claude" in model_text
-
-
-def _foundry_resource_name() -> str:
-    project_endpoint = (os.environ.get("MAF_FOUNDRY_PROJECT_ENDPOINT") or os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")).strip()
-    match = re.match(r"https://([^.]+)\.services\.ai\.azure\.com(?:/|$)", project_endpoint)
-    return match.group(1) if match else ""
-
-
 def _get_chat_client(model_config: dict[str, Any] | None = None) -> Any:
-    """Create the appropriate Foundry chat client using the service principal credential."""
+    """Create a FoundryChatClient using the service principal credential."""
     project_endpoint = (os.environ.get("MAF_FOUNDRY_PROJECT_ENDPOINT") or os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")).rstrip("/")
     deployment_name = _resolve_model_deployment(model_config)
-
-    if _is_anthropic_model(model_config):
-        if AnthropicFoundryClient is None:
-            raise RuntimeError("Anthropic model selected, but agent-framework-anthropic is not installed in the hosted runtime image.")
-        resource = _foundry_resource_name()
-        if not resource:
-            raise RuntimeError("Anthropic model selected, but cannot derive Foundry resource name from FOUNDRY_PROJECT_ENDPOINT.")
-        token_provider = get_bearer_token_provider(_credential(), os.environ.get("FOUNDRY_TOKEN_SCOPE", "https://ai.azure.com/.default"))
-        return AnthropicFoundryClient(
-            model=((model_config or {}).get("model_name") or deployment_name or None),
-            resource=resource,
-            azure_ad_token_provider=token_provider,
-        )
 
     return FoundryChatClient(
         project_endpoint=project_endpoint or None,

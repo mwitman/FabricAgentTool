@@ -681,7 +681,8 @@ async def chat(request: Request):
             _mem0_logger.warning("Mem0 search failed: %s", exc)
 
     if context_blocks:
-        enriched_message = f"{'\n\n'.join(context_blocks)}\n\n[Current user message]\n{message}"
+        separator = "\n\n"
+        enriched_message = f"{separator.join(context_blocks)}\n\n[Current user message]\n{message}"
 
     # --- Proxy to Foundry Hosted Agent (SSE streaming) ---
     async def event_stream():
