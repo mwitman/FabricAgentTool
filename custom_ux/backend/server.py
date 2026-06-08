@@ -781,15 +781,20 @@ async def health():
 async def agents_list():
     """Return all agent bindings (no user filtering). Used for admin views."""
     bindings = _get_all_agent_bindings()
-    return {"agents": [
-        {
-            "key": b.get("agent_name", ""),
-            "label": b.get("project_display_name") or b.get("agent_name", ""),
-            "agent_name": b.get("agent_name", ""),
+    seen: set[str] = set()
+    agents = []
+    for b in bindings:
+        name = b.get("agent_name", "")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        agents.append({
+            "key": name,
+            "label": b.get("project_display_name") or name,
+            "agent_name": name,
             "icon": "bot",
-        }
-        for b in bindings if b.get("agent_name")
-    ]}
+        })
+    return {"agents": agents}
 
 
 @app.post("/api/agents-for-user")
@@ -801,15 +806,20 @@ async def agents_for_user(request: Request):
     if not user_object_id:
         return JSONResponse({"error": "user_object_id is required."}, status_code=400)
     bindings = _get_agents_for_user(user_object_id, group_ids)
-    return {"agents": [
-        {
-            "key": b.get("agent_name", ""),
-            "label": b.get("project_display_name") or b.get("agent_name", ""),
-            "agent_name": b.get("agent_name", ""),
+    seen: set[str] = set()
+    agents = []
+    for b in bindings:
+        name = b.get("agent_name", "")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        agents.append({
+            "key": name,
+            "label": b.get("project_display_name") or name,
+            "agent_name": name,
             "icon": "bot",
-        }
-        for b in bindings if b.get("agent_name")
-    ]}
+        })
+    return {"agents": agents}
 
 
 @app.get("/api/my-agents")
@@ -846,15 +856,20 @@ async def my_agents(request: Request):
         pass  # Continue with just the user OID if group resolution fails
 
     bindings = _get_agents_for_user(user_object_id, group_ids)
-    return {"agents": [
-        {
-            "key": b.get("agent_name", ""),
-            "label": b.get("project_display_name") or b.get("agent_name", ""),
-            "agent_name": b.get("agent_name", ""),
+    seen: set[str] = set()
+    agents = []
+    for b in bindings:
+        name = b.get("agent_name", "")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        agents.append({
+            "key": name,
+            "label": b.get("project_display_name") or name,
+            "agent_name": name,
             "icon": "bot",
-        }
-        for b in bindings if b.get("agent_name")
-    ]}
+        })
+    return {"agents": agents}
 
 
 # ---------------------------------------------------------------------------
