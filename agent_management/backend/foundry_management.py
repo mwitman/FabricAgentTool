@@ -52,8 +52,6 @@ async def create_hosted_agent_version(
     api_version = os.environ.get("FOUNDRY_API_VERSION", "v1")
     features = os.environ.get("FOUNDRY_FEATURES", "HostedAgents=V1Preview")
     url = f"{endpoint}/agents/{agent_name}/versions?api-version={api_version}"
-    all_env = {**_agent_environment(), **(environment_variables or {})}
-    env_list = [{"name": k, "value": v} for k, v in all_env.items()]
     body = {
         "definition": {
             "kind": "hosted",
@@ -61,7 +59,7 @@ async def create_hosted_agent_version(
             "cpu": "1",
             "memory": "2Gi",
             "container_protocol_versions": [{"protocol": "responses", "version": "1.0.0"}],
-            "environment_variables": env_list,
+            "environment_variables": {**_agent_environment(), **(environment_variables or {})},
         },
         "description": description,
         "metadata": metadata or {"source": "agent_management"},
