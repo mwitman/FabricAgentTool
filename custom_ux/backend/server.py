@@ -7,10 +7,10 @@ Exposes:
     GET  /                  — serves the built React frontend (static files)
 
 Authentication:
-    The frontend acquires a Fabric-scoped access token via MSAL.js and sends it
-    as ``Authorization: Bearer <token>``. For Foundry Hosted Agents, the backend
-    uses its own Azure credential to call Foundry and passes the Fabric token in
-    the request body so tools can call Fabric GraphQL as the signed-in user.
+    The frontend acquires a Graph-scoped token (User.Read) for identity and sends
+    it as ``Authorization: Bearer <token>``. Fabric and Power BI tokens are passed
+    in the request body so the hosted agent can call Fabric APIs as the signed-in
+    user. The backend uses its own service principal credential to call Foundry.
 
 Configuration:
     FOUNDRY_PROJECT_ENDPOINT — Foundry project endpoint ending in /api/projects/<project>.
@@ -646,21 +646,16 @@ async def _proxy_foundry_agent(
 # ---------------------------------------------------------------------------
 @app.post("/api/chat")
 async def chat(request: Request):
-    # --- Extract the Fabric bearer token from the Authorization header ---
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return JSONResponse(
-            {"error": "Missing or invalid Authorization header. A Fabric-scoped Bearer token is required."},
-            status_code=401,
-        )
-    fabric_token = auth_header[len("Bearer "):]
-
     body = await request.json()
     message: str = body.get("message", "")
     conversation_id: str = body.get("conversation_id") or str(uuid.uuid4())
     user_id: str = body.get("user_id") or "default_user"
     agent: str = _normalize_agent(body.get("agent", ""))
+    fabric_token: str = body.get("fabric_token") or body.get("fabricToken") or ""
     powerbi_token: str | None = body.get("powerbi_token") or body.get("powerbiToken")
+
+    if not fabric_token:
+        return JSONResponse({"error": "fabric_token is required in the request body."}, status_code=400)
 
     if not message.strip():
         return JSONResponse({"error": "message is required"}, status_code=400)

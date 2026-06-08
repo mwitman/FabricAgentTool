@@ -197,10 +197,11 @@ export default function App() {
     return () => window.clearTimeout(timeout);
   }, [account, conversations, getGraphToken]);
 
-  /** Acquire user-scoped access tokens for Fabric and semantic model queries. */
-  const getToken = useCallback(async (): Promise<{ fabricToken: string; powerBiToken: string }> => {
+  /** Acquire user-scoped access tokens for Graph (identity), Fabric, and Power BI. */
+  const getToken = useCallback(async (): Promise<{ graphToken: string; fabricToken: string; powerBiToken: string }> => {
     if (!account) throw new Error("No active account");
     try {
+      const graphResponse = await instance.acquireTokenSilent({ scopes: ["User.Read"], account });
       const fabricResponse = await instance.acquireTokenSilent({
         ...fabricTokenRequest,
         account,
@@ -209,12 +210,13 @@ export default function App() {
         ...powerBiTokenRequest,
         account,
       });
-      return { fabricToken: fabricResponse.accessToken, powerBiToken: powerBiResponse.accessToken };
+      return { graphToken: graphResponse.accessToken, fabricToken: fabricResponse.accessToken, powerBiToken: powerBiResponse.accessToken };
     } catch (err) {
       if (err instanceof InteractionRequiredAuthError) {
+        const graphResponse = await instance.acquireTokenPopup({ scopes: ["User.Read"] });
         const fabricResponse = await instance.acquireTokenPopup(fabricTokenRequest);
         const powerBiResponse = await instance.acquireTokenPopup(powerBiTokenRequest);
-        return { fabricToken: fabricResponse.accessToken, powerBiToken: powerBiResponse.accessToken };
+        return { graphToken: graphResponse.accessToken, fabricToken: fabricResponse.accessToken, powerBiToken: powerBiResponse.accessToken };
       }
       throw err;
     }

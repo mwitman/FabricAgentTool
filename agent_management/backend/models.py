@@ -32,8 +32,15 @@ SemanticModelRef = DataSourceRef
 
 class ModelConfig(BaseModel):
     """Foundry model deployment selection for an agent."""
+    model_config = ConfigDict(extra="allow")
+
     deployment_name: str = ""
     model_display_name: str = ""
+    model_name: str = ""
+    provider: str = ""
+    publisher: str = ""
+    model_format: str = ""
+    capabilities: dict[str, Any] = Field(default_factory=dict)
 
 
 class SubagentConfig(BaseModel):

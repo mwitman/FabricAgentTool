@@ -15,6 +15,11 @@ export type SemanticModelRef = DataSourceRef;
 export interface ModelConfig {
   deployment_name: string;
   model_display_name: string;
+  model_name?: string;
+  provider?: string;
+  publisher?: string;
+  model_format?: string;
+  capabilities?: Record<string, unknown>;
 }
 
 export interface SubagentConfig {

@@ -356,6 +356,8 @@ async def deploy_submit_foundry(request: DeploymentRequest):
         env_vars: dict[str, str] = {"MAF_MGMT_PROJECT_ID": saved_project.id}
         if _model_deployment:
             env_vars["AZURE_OPENAI_DEPLOYMENT_NAME"] = _model_deployment
+            env_vars["FOUNDRY_MODEL_DEPLOYMENT_NAME"] = _model_deployment
+            env_vars["FOUNDRY_MODEL"] = _model_deployment
         # Add a deployment nonce so Foundry always creates a new version
         env_vars["project_deployed_at"] = datetime.now(timezone.utc).isoformat()
         result = await create_hosted_agent_version(

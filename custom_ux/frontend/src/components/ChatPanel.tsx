@@ -11,7 +11,7 @@ interface Props {
   setMessages: React.Dispatch<React.SetStateAction<Message[]>>;
   onToggleSidebar: () => void;
   sidebarOpen: boolean;
-  getToken: () => Promise<{ fabricToken: string; powerBiToken: string }>;
+  getToken: () => Promise<{ graphToken: string; fabricToken: string; powerBiToken: string }>;
   userId: string;
   selectedAgent: AgentTarget;
   selectedAgentLabel: string;
@@ -75,20 +75,21 @@ export default function ChatPanel({
       abortRef.current = controller;
 
       try {
-        // Acquire a Fabric-scoped token before calling the API
-        const { fabricToken, powerBiToken } = await getToken();
+        // Acquire tokens: Graph for identity (Auth header), Fabric+PBI in body
+        const { graphToken, fabricToken, powerBiToken } = await getToken();
 
         const resp = await fetch("/api/chat", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            Authorization: `Bearer ${fabricToken}`,
+            Authorization: `Bearer ${graphToken}`,
           },
           body: JSON.stringify({
             message: text,
             conversation_id: conversationId,
             user_id: userId,
             agent: selectedAgent,
+            fabric_token: fabricToken,
             powerbi_token: powerBiToken,
           }),
           signal: controller.signal,

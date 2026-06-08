@@ -55,9 +55,18 @@ async def list_foundry_model_deployments() -> dict[str, Any]:
     deployments = []
     for dep in raw_deployments:
         name = dep.get("name") or dep.get("deployment_name") or dep.get("id") or ""
-        model_name = dep.get("model", {}).get("name") if isinstance(dep.get("model"), dict) else dep.get("model_name", "")
+        model = dep.get("model") if isinstance(dep.get("model"), dict) else {}
+        model_name = model.get("name") or dep.get("model_name", "")
+        provider = model.get("provider") or model.get("publisher") or dep.get("provider") or dep.get("publisher") or ""
+        model_format = model.get("format") or model.get("model_format") or dep.get("format") or dep.get("model_format") or ""
+        capabilities = model.get("capabilities") or dep.get("capabilities") or {}
         deployments.append({
             "deployment_name": name,
             "model_display_name": model_name or name,
+            "model_name": model_name or "",
+            "provider": provider,
+            "publisher": model.get("publisher") or dep.get("publisher") or provider,
+            "model_format": model_format,
+            "capabilities": capabilities if isinstance(capabilities, dict) else {},
         })
     return {"deployments": deployments}

@@ -21,7 +21,7 @@ from urllib.parse import urljoin
 import aiohttp
 import uvicorn
 from azure.cosmos import CosmosClient
-from azure.identity import ClientSecretCredential, DefaultAzureCredential
+from azure.identity import ClientSecretCredential, DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
@@ -54,8 +54,9 @@ except ImportError:
 
 # FoundryChatClient — may live in different submodules
 try:
-    from agent_framework.foundry import FoundryChatClient
+    from agent_framework.foundry import AnthropicFoundryClient, FoundryChatClient
 except ImportError:
+    AnthropicFoundryClient = None  # type: ignore[assignment]
     from agent_framework import FoundryChatClient
 
 load_dotenv()
@@ -101,10 +102,56 @@ def _credential():
     return DefaultAzureCredential(exclude_interactive_browser_credential=True)
 
 
-def _get_chat_client(model_config: dict[str, str] | None = None) -> FoundryChatClient:
-    """Create a FoundryChatClient using the service principal credential."""
+def _resolve_model_deployment(model_config: dict[str, Any] | None = None) -> str:
+    return (
+        (model_config or {}).get("deployment_name")
+        or os.environ.get("FOUNDRY_MODEL_DEPLOYMENT_NAME")
+        or os.environ.get("FOUNDRY_MODEL")
+        or os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME", "")
+    )
+
+
+def _model_config_text(model_config: dict[str, Any] | None = None) -> str:
+    fields = [
+        "deployment_name",
+        "model_display_name",
+        "model_name",
+        "provider",
+        "publisher",
+        "format",
+        "model_format",
+    ]
+    return " ".join(str((model_config or {}).get(field, "")) for field in fields).lower()
+
+
+def _is_anthropic_model(model_config: dict[str, Any] | None = None) -> bool:
+    model_text = _model_config_text(model_config)
+    return "anthropic" in model_text or "claude" in model_text
+
+
+def _foundry_resource_name() -> str:
+    project_endpoint = (os.environ.get("MAF_FOUNDRY_PROJECT_ENDPOINT") or os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")).strip()
+    match = re.match(r"https://([^.]+)\.services\.ai\.azure\.com(?:/|$)", project_endpoint)
+    return match.group(1) if match else ""
+
+
+def _get_chat_client(model_config: dict[str, Any] | None = None) -> Any:
+    """Create the appropriate Foundry chat client using the service principal credential."""
     project_endpoint = (os.environ.get("MAF_FOUNDRY_PROJECT_ENDPOINT") or os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")).rstrip("/")
-    deployment_name = (model_config or {}).get("deployment_name") or os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME", "")
+    deployment_name = _resolve_model_deployment(model_config)
+
+    if _is_anthropic_model(model_config):
+        if AnthropicFoundryClient is None:
+            raise RuntimeError("Anthropic model selected, but agent-framework-anthropic is not installed in the hosted runtime image.")
+        resource = _foundry_resource_name()
+        if not resource:
+            raise RuntimeError("Anthropic model selected, but cannot derive Foundry resource name from FOUNDRY_PROJECT_ENDPOINT.")
+        token_provider = get_bearer_token_provider(_credential(), os.environ.get("FOUNDRY_TOKEN_SCOPE", "https://ai.azure.com/.default"))
+        return AnthropicFoundryClient(
+            model=((model_config or {}).get("model_name") or deployment_name or None),
+            resource=resource,
+            azure_ad_token_provider=token_provider,
+        )
 
     return FoundryChatClient(
         project_endpoint=project_endpoint or None,
@@ -523,6 +570,25 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
                     return json.dumps({"status": response.status, "error": text})
                 return text
 
+    async def _call_fabric_mcp_jsonrpc_payload(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        text = await _call_fabric_mcp_jsonrpc(method, params)
+        try:
+            payload = json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            return {"raw": text}
+        return payload if isinstance(payload, dict) else {"raw": payload}
+
+    def _mcp_payload_error(payload: dict[str, Any]) -> Any:
+        return payload.get("error") or payload.get("errors") or (payload if payload.get("status") else None)
+
+    async def _fabric_mcp_tools() -> list[dict[str, Any]]:
+        tools_payload = await _call_fabric_mcp_jsonrpc_payload("tools/list", {})
+        result = tools_payload.get("result") if isinstance(tools_payload.get("result"), dict) else tools_payload
+        tools = result.get("tools") if isinstance(result, dict) else []
+        if not isinstance(tools, list):
+            return []
+        return [tool for tool in tools if isinstance(tool, dict)]
+
     @ai_function(
         name="call_fabric_mcp",
         description=(
@@ -584,7 +650,7 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
         name="call_fabric_mcp_tool",
         description=(
             "Call a Fabric MCP tool by name after discovering MCP tools with call_fabric_mcp('tools/list'). "
-            "Use this for configured SQL endpoints, Fabric Data Agents, and broader Fabric operations."
+            "Use this for configured SQL endpoints and broader Fabric operations."
         ),
     )
     async def call_fabric_mcp_tool(tool_name: str, arguments_json: str = "{}") -> str:
@@ -631,30 +697,18 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
     @ai_function(
         name="invoke_fabric_data_agent",
         description=(
-            "Invoke a configured Fabric Data Agent through Fabric MCP. "
+            "Invoke a configured Fabric Data Agent directly via the Fabric REST API. "
             "Use list_configured_fabric_data_sources first to find workspace_id and item_id."
         ),
     )
     async def invoke_fabric_data_agent(workspace_id: str, data_agent_id: str, prompt: str) -> str:
         if not _can_invoke_data_agent(workspace_id, data_agent_id):
             return json.dumps({"error": "That Fabric Data Agent is not configured for this agent project."})
-        tool_name = os.environ.get("FABRIC_MCP_DATA_AGENT_TOOL_NAME", "invoke_data_agent")
-        return await _call_fabric_mcp_jsonrpc(
-            "tools/call",
-            {
-                "name": tool_name,
-                "arguments": {
-                    "workspace_id": workspace_id,
-                    "workspaceId": workspace_id,
-                    "data_agent_id": data_agent_id,
-                    "dataAgentId": data_agent_id,
-                    "item_id": data_agent_id,
-                    "itemId": data_agent_id,
-                    "prompt": prompt,
-                    "message": prompt,
-                },
-            },
-        )
+        url = f"{FABRIC_API}/workspaces/{workspace_id}/dataAgents/{data_agent_id}/query"
+        body = {"question": prompt}
+        async with aiohttp.ClientSession() as session:
+            payload = await _post_json(session, url, _fabric_headers(fabric_token), body)
+            return json.dumps(payload, indent=2)
 
     @ai_function(
         name="get_fabric_item_definition",
@@ -977,12 +1031,19 @@ def _extract_fabric_token(request: Request, body: dict[str, Any]) -> str | None:
 def _responses_payload(response_text: str, conversation_id: str, project: dict[str, Any]) -> dict[str, Any]:
     response_id = f"resp_{uuid.uuid4().hex}"
     message_id = f"msg_{uuid.uuid4().hex}"
+    mode = project.get("deployment_mode")
+    if mode == "standalone":
+        model_config = project.get("standalone_agent", {}).get("model_config")
+    elif mode == "orchestrator_only":
+        model_config = project.get("orchestrator_only", {}).get("model_config")
+    else:
+        model_config = project.get("orchestrator", {}).get("model_config")
     return {
         "id": response_id,
         "object": "response",
         "created_at": int(time.time()),
         "status": "completed",
-        "model": os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME", ""),
+        "model": _resolve_model_deployment(model_config),
         "metadata": {"conversation_id": conversation_id, "project_id": project.get("id")},
         "output": [
             {

@@ -201,6 +201,8 @@ def _redact_sensitive(value: Any) -> Any:
 def _agent_environment() -> dict[str, str]:
     names = [
         "AZURE_OPENAI_DEPLOYMENT_NAME",
+        "FOUNDRY_MODEL_DEPLOYMENT_NAME",
+        "FOUNDRY_MODEL",
         "AZURE_OPENAI_API_VERSION",
         "AZURE_TENANT_ID",
         "APP_CLIENT_ID",
