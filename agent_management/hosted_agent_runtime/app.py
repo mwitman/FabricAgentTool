@@ -104,8 +104,7 @@ def _credential():
 def _resolve_model_deployment(model_config: dict[str, Any] | None = None) -> str:
     return (
         (model_config or {}).get("deployment_name")
-        or os.environ.get("FOUNDRY_MODEL_DEPLOYMENT_NAME")
-        or os.environ.get("FOUNDRY_MODEL")
+        or os.environ.get("model_deployment_name")
         or os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME", "")
     )
 
