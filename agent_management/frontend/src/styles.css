@@ -510,6 +510,73 @@ pre {
 .ds-combobox-item:last-child { border-bottom: none; }
 .ds-combobox-item:hover { background: #e8f0fe; }
 .ds-combobox-item.selected { background: #eff6ff; border-left: 3px solid #3b82f6; }
+
+/* Dev Chat History */
+.dev-chat-history {
+  flex: 1;
+  overflow-y: auto;
+  border: 1px solid #dbe3eb;
+  border-radius: 8px;
+  padding: 12px;
+  min-height: 300px;
+  max-height: 500px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: #fafbfc;
+}
+.dev-chat-msg {
+  padding: 8px 12px;
+  border-radius: 8px;
+  max-width: 85%;
+}
+.dev-chat-msg strong {
+  display: block;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+  color: #6b7280;
+}
+.dev-chat-msg pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-size: 13px;
+  background: none;
+  border: none;
+  padding: 0;
+}
+.dev-chat-user {
+  background: #e0edff;
+  align-self: flex-end;
+}
+.dev-chat-assistant {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  align-self: flex-start;
+}
+.typing-indicator {
+  color: #6b7280;
+  font-style: italic;
+  margin: 0;
+}
+.dev-chat-input {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.dev-chat-input input {
+  flex: 1;
+  padding: 10px 14px;
+  border: 1px solid #dbe3eb;
+  border-radius: 8px;
+  font-size: 14px;
+}
+.dev-chat-input button {
+  padding: 10px 18px;
+  white-space: nowrap;
+}
 .ds-combobox-item strong { font-size: 13px; }
 .ds-combobox-meta { font-size: 11px; color: #64748b; }
 .ds-combobox-empty { padding: 10px 12px; color: #94a3b8; font-style: italic; font-size: 13px; }

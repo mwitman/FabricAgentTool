@@ -75,11 +75,13 @@ export default function App() {
   const [models, setModels] = useState<FabricItem[]>([]);
   const [status, setStatus] = useState("Ready");
   const [generatingPrompt, setGeneratingPrompt] = useState<string | null>(null);
-  const [devMessage, setDevMessage] = useState("Which semantic model should answer sales questions?");
+  const [devMessage, setDevMessage] = useState("");
   const [devResponse, setDevResponse] = useState("");
   const [devTrace, setDevTrace] = useState<DevTraceStep[]>([]);
   const [devDebug, setDevDebug] = useState<any>(null);
   const [isDevRunning, setIsDevRunning] = useState(false);
+  const [devRunLocal, setDevRunLocal] = useState(true);
+  const [devChatHistory, setDevChatHistory] = useState<Array<{ role: "user" | "assistant"; content: string }>>([]);
   const [isDeploying, setIsDeploying] = useState(false);
   const [deploymentUiState, setDeploymentUiState] = useState<DeploymentUiState>("idle");
   const [deploymentMessage, setDeploymentMessage] = useState("");
@@ -99,6 +101,7 @@ export default function App() {
   const [subagentAddAcknowledged, setSubagentAddAcknowledged] = useState(false);
   const savedProjectSnapshot = useRef<string>(JSON.stringify(newProject()));
   const subagentAddTimeout = useRef<number | null>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null);
   const conversationId = useMemo(() => crypto.randomUUID(), []);
   const currentUserObjectId = useMemo(() => {
     const claims = account?.idTokenClaims as any;
@@ -153,6 +156,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("agentManagementTheme", darkMode ? "dark" : "light");
   }, [darkMode]);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [devChatHistory, isDevRunning]);
 
   useEffect(() => () => {
     if (subagentAddTimeout.current !== null) {
@@ -537,28 +544,37 @@ export default function App() {
   };
 
   const runDevChat = async () => {
+    const msg = devMessage.trim();
+    if (!msg) return;
     try {
       setIsDevRunning(true);
       if (!devProject) throw new Error("Select a project first.");
       if (!visibleProjects.some((candidate) => candidate.id === devProject.id)) throw new Error("You do not have access to this project.");
-      setStatus(`Running Dev UI against ${devProject.name}`);
-      setDevTrace([{ step: "start", status: "running", detail: "Preparing selected project context and acquiring Fabric tokens." }]);
+      setDevChatHistory((prev) => [...prev, { role: "user", content: msg }]);
+      setDevMessage("");
+      const modeLabel = devRunLocal ? "locally (in-process)" : "against deployed Foundry agent";
+      setStatus(`Running Dev UI ${modeLabel} for ${devProject.name}`);
+      setDevTrace([{ step: "start", status: "running", detail: `Preparing context. Mode: ${devRunLocal ? "Local (traced)" : "Deployed (Foundry)"}.` }]);
       const projectResponse = await fetch(`/api/projects/${devProject.id}`);
       const fullDevProject = await readApiResponse(projectResponse);
       const fabricToken = account ? await getFabricToken() : undefined;
       const powerbiToken = account ? await getPowerBiToken() : undefined;
-      const response = await fetch("/api/dev/chat", {
+      const chatEndpoint = devRunLocal ? "/api/dev/chat-local" : "/api/dev/chat";
+      const response = await fetch(chatEndpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project: fullDevProject, message: devMessage, conversation_id: conversationId, fabric_token: fabricToken, powerbi_token: powerbiToken }),
+        body: JSON.stringify({ project: fullDevProject, message: msg, conversation_id: conversationId, fabric_token: fabricToken, powerbi_token: powerbiToken }),
       });
       const payload = await readApiResponse(response);
-      setDevResponse(payload.response ?? "No response");
+      const assistantMsg = payload.response ?? "No response";
+      setDevResponse(assistantMsg);
+      setDevChatHistory((prev) => [...prev, { role: "assistant", content: assistantMsg }]);
       setDevTrace(payload.debug?.trace ?? []);
       setDevDebug(payload.debug ?? null);
       setStatus("Dev UI run complete");
     } catch (error: any) {
       setStatus(`Dev UI failed: ${error.message}`);
+      setDevChatHistory((prev) => [...prev, { role: "assistant", content: `Error: ${error.message}` }]);
       setDevTrace([{ step: "error", status: "failed", detail: error.message }]);
     } finally {
       setIsDevRunning(false);
@@ -920,27 +936,74 @@ export default function App() {
           </div>
         </section> : <section className="dev-layout" id="dev">
           <div className="panel dev-console">
-            <div className="section-header"><h2>Agent Dev UI</h2>{devProject ? <span className="badge">{devProject.deployment_mode}</span> : null}</div>
-            <label>Project to test<select value={devProjectId} onChange={(event) => setDevProjectId(event.target.value)}><option value="">Select project</option>{visibleProjects.map((savedProject) => <option value={savedProject.id ?? ""} key={savedProject.id ?? savedProject.name}>{savedProject.name}</option>)}</select></label>
+            <div className="section-header"><h2>Agent Dev UI</h2>{devProject ? <span className="badge">{devProject.deployment_mode}</span> : null}{devRunLocal ? <span className="badge">local</span> : <span className="badge">deployed</span>}</div>
+            <label>Project to test<select value={devProjectId} onChange={(event) => { setDevProjectId(event.target.value); setDevChatHistory([]); setDevTrace([]); setDevDebug(null); setDevResponse(""); }}><option value="">Select project</option>{visibleProjects.map((savedProject) => <option value={savedProject.id ?? ""} key={savedProject.id ?? savedProject.name}>{savedProject.name}</option>)}</select></label>
+            <label className="toggle-label"><input type="checkbox" checked={devRunLocal} onChange={(e) => setDevRunLocal(e.target.checked)} /> Run locally (full tool tracing, no Foundry deployment needed)</label>
             {devProject ? <div className="project-test-summary"><strong>{devProject.name}</strong><span>{devProjectAgentCount} agent{devProjectAgentCount === 1 ? "" : "s"}</span><p>{devProject.description || "No description"}</p></div> : null}
-            <textarea value={devMessage} onChange={(e) => setDevMessage(e.target.value)} />
-            <button disabled={isDevRunning || !devProject} onClick={runDevChat}>
-              {isDevRunning ? <Loader2 className="spin" size={16} /> : <FlaskConical size={16} />}
-              {isDevRunning ? "Running Dev UI..." : "Run Dev UI"}
-            </button>
-            <pre>{devResponse || "Run the Dev UI to see the agent response."}</pre>
+            <div className="dev-chat-history">
+              {devChatHistory.length === 0 ? <div className="empty-state"><p>Ask the agent a question to start a conversation.</p></div> : devChatHistory.map((msg, i) => (
+                <div key={i} className={`dev-chat-msg dev-chat-${msg.role}`}>
+                  <strong>{msg.role === "user" ? "You" : "Agent"}</strong>
+                  <pre>{msg.content}</pre>
+                </div>
+              ))}
+              {isDevRunning ? <div className="dev-chat-msg dev-chat-assistant"><strong>Agent</strong><p className="typing-indicator">Thinking...</p></div> : null}
+              <div ref={chatEndRef} />
+            </div>
+            <div className="dev-chat-input">
+              <input
+                type="text"
+                value={devMessage}
+                onChange={(e) => setDevMessage(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !isDevRunning) { e.preventDefault(); runDevChat(); } }}
+                placeholder={devProject ? "Ask the agent a question..." : "Select a project first"}
+                disabled={isDevRunning || !devProject}
+              />
+              <button disabled={isDevRunning || !devProject || !devMessage.trim()} onClick={runDevChat}>
+                {isDevRunning ? <Loader2 className="spin" size={16} /> : "Send"}
+              </button>
+            </div>
           </div>
 
           <div className="panel trace-panel">
             <h2>Behind The Scenes</h2>
             <div className="trace-list">
-              {devTrace.length ? devTrace.map((step, index) => <div className="trace-step" key={`${step.step}-${index}`}>
-                <div><strong>{step.step}</strong><span>{step.status}</span></div>
-                <p>{step.detail}</p>
-                {step.data ? <pre>{JSON.stringify(step.data, null, 2)}</pre> : null}
-              </div>) : <div className="trace-step"><div><strong>idle</strong><span>waiting</span></div><p>Run the Dev UI to inspect routing, metadata lookup, prompt construction, and model response steps.</p></div>}
+              {devTrace.length ? devTrace.map((step, index) => {
+                const parseJsonStrings = (obj: any): any => {
+                  if (typeof obj === "string") {
+                    try { return parseJsonStrings(JSON.parse(obj)); } catch { return obj; }
+                  }
+                  if (Array.isArray(obj)) return obj.map(parseJsonStrings);
+                  if (obj && typeof obj === "object") {
+                    const out: any = {};
+                    for (const [k, v] of Object.entries(obj)) out[k] = parseJsonStrings(v);
+                    return out;
+                  }
+                  return obj;
+                };
+                const readable = (data: any) => JSON.stringify(parseJsonStrings(data), null, 2).replace(/\\n/g, "\n").replace(/\\"/g, '"');
+                return <div className="trace-step" key={`${step.step}-${index}`}>
+                  <div><strong>{step.step}</strong><span>{step.status}</span></div>
+                  <p>{step.detail}</p>
+                  {step.data ? <pre>{readable(step.data)}</pre> : null}
+                </div>;
+              }) : <div className="trace-step"><div><strong>idle</strong><span>waiting</span></div><p>Run the Dev UI to inspect routing, metadata lookup, prompt construction, and model response steps.</p></div>}
             </div>
-            <pre>{devDebug ? JSON.stringify(devDebug, null, 2) : "No debug payload yet."}</pre>
+            <pre>{devDebug ? (() => {
+              const parseJsonStrings = (obj: any): any => {
+                if (typeof obj === "string") {
+                  try { return parseJsonStrings(JSON.parse(obj)); } catch { return obj; }
+                }
+                if (Array.isArray(obj)) return obj.map(parseJsonStrings);
+                if (obj && typeof obj === "object") {
+                  const out: any = {};
+                  for (const [k, v] of Object.entries(obj)) out[k] = parseJsonStrings(v);
+                  return out;
+                }
+                return obj;
+              };
+              return JSON.stringify(parseJsonStrings(devDebug), null, 2).replace(/\\n/g, "\n").replace(/\\"/g, '"');
+            })() : "No debug payload yet."}</pre>
           </div>
         </section>}
         {activeTab === "projects" ? null : <div className="status">{status}</div>}

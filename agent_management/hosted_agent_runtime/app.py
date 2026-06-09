@@ -226,6 +226,15 @@ def _get_configured_data_sources(project: dict[str, Any]) -> list[dict[str, Any]
     if mode == "standalone":
         source = project.get("standalone_agent", {}).get("semantic_model", {})
         return [_normalize_data_source(source)] if _has_configured_source(source) else []
+    if mode == "orchestrator_only":
+        # orchestrator_only projects may have data_sources at the top level or in config
+        top_sources = project.get("data_sources") or project.get("orchestrator_only", {}).get("data_sources") or []
+        sources = []
+        for source in top_sources:
+            if _has_configured_source(source):
+                sources.append(_normalize_data_source(source))
+        return sources
+    # orchestrator mode: check subagents
     sources = []
     for subagent in project.get("orchestrator", {}).get("subagents", []):
         source = subagent.get("semantic_model", {})
@@ -396,7 +405,7 @@ def _access_token_str() -> str:
     return token.token
 
 
-def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str | None = None) -> ChatAgent:
+def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str | None = None, tool_wrapper: Any = None) -> ChatAgent:
     """Create a ChatAgent from project config with source-aware Fabric tools."""
     # Determine model_config based on deployment mode
     mode = project.get("deployment_mode")
@@ -438,7 +447,7 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
             instructions=instructions,
             name=project.get("name", "Orchestrator Agent"),
             description=project.get("description", "An orchestrator that delegates to existing agents."),
-            tools=tools,
+            tools=[tool_wrapper(t) for t in tools] if tool_wrapper else tools,
         )
 
     data_sources = _get_configured_data_sources(project)
@@ -665,11 +674,87 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
     async def invoke_fabric_data_agent(workspace_id: str, data_agent_id: str, prompt: str) -> str:
         if not _can_invoke_data_agent(workspace_id, data_agent_id):
             return json.dumps({"error": "That Fabric Data Agent is not configured for this agent project."})
-        url = f"{FABRIC_API}/workspaces/{workspace_id}/dataAgents/{data_agent_id}/query"
-        body = {"question": prompt}
+        # Fabric Data Agent uses the OpenAI Assistants API pattern:
+        # 1. Create a thread, 2. Add a message, 3. Create a run, 4. Poll run, 5. Get messages
+        api_version = "2024-12-01-preview"
+        base_url = f"{FABRIC_API}/workspaces/{workspace_id}/dataagents/{data_agent_id}/aiassistant/openai"
+        headers = _fabric_headers(fabric_token)
+
+        def _url(path: str) -> str:
+            sep = "&" if "?" in path else "?"
+            return f"{base_url}{path}{sep}api-version={api_version}"
+
         async with aiohttp.ClientSession() as session:
-            payload = await _post_json(session, url, _fabric_headers(fabric_token), body)
-            return json.dumps(payload, indent=2)
+            # Step 0: Create assistant (Fabric requires this before creating a run)
+            async with session.post(_url("/assistants"), headers=headers, json={"model": "not used"}) as resp:
+                if resp.status >= 400:
+                    text = await resp.text()
+                    return json.dumps({"error": f"Failed to create assistant (HTTP {resp.status})", "detail": text[:500]})
+                assistant = await resp.json()
+            assistant_id = assistant.get("id")
+            if not assistant_id:
+                return json.dumps({"error": "No assistant ID returned", "response": assistant})
+
+            # Step 1: Create thread
+            async with session.post(_url("/threads"), headers=headers, json={}) as resp:
+                if resp.status >= 400:
+                    text = await resp.text()
+                    return json.dumps({"error": f"Failed to create thread (HTTP {resp.status})", "detail": text[:500]})
+                thread = await resp.json()
+            thread_id = thread.get("id")
+            if not thread_id:
+                return json.dumps({"error": "No thread ID returned", "response": thread})
+
+            # Step 2: Add user message
+            async with session.post(_url(f"/threads/{thread_id}/messages"), headers=headers, json={"role": "user", "content": prompt}) as resp:
+                if resp.status >= 400:
+                    text = await resp.text()
+                    return json.dumps({"error": f"Failed to add message (HTTP {resp.status})", "detail": text[:500]})
+
+            # Step 3: Create run using the assistant ID from step 0
+            async with session.post(_url(f"/threads/{thread_id}/runs"), headers=headers, json={"assistant_id": assistant_id}) as resp:
+                if resp.status >= 400:
+                    text = await resp.text()
+                    return json.dumps({"error": f"Failed to create run (HTTP {resp.status})", "detail": text[:500]})
+                run = await resp.json()
+            run_id = run.get("id")
+            if not run_id:
+                return json.dumps({"error": "No run ID returned", "response": run})
+
+            # Step 4: Poll until run completes (max 120s)
+            import asyncio
+            for _ in range(120):
+                await asyncio.sleep(1)
+                async with session.get(_url(f"/threads/{thread_id}/runs/{run_id}"), headers=headers) as resp:
+                    if resp.status >= 400:
+                        break
+                    run_status = await resp.json()
+                    status = run_status.get("status", "")
+                    if status in ("completed", "failed", "cancelled", "expired"):
+                        break
+            if status == "failed":
+                error = run_status.get("last_error") or run_status.get("error") or "Run failed"
+                return json.dumps({"error": "Data Agent run failed", "detail": error})
+
+            # Step 5: Get assistant messages
+            async with session.get(_url(f"/threads/{thread_id}/messages"), headers=headers) as resp:
+                if resp.status >= 400:
+                    text = await resp.text()
+                    return json.dumps({"error": f"Failed to get messages (HTTP {resp.status})", "detail": text[:500]})
+                messages_payload = await resp.json()
+
+            # Extract the last assistant message
+            messages = messages_payload.get("data") or messages_payload.get("messages") or []
+            assistant_msgs = [m for m in messages if m.get("role") == "assistant"]
+            if assistant_msgs:
+                last_msg = assistant_msgs[-1]
+                content = last_msg.get("content")
+                if isinstance(content, list):
+                    # OpenAI format: content is list of {type, text: {value}}
+                    texts = [c.get("text", {}).get("value", "") if isinstance(c, dict) else str(c) for c in content]
+                    return "\n".join(texts) or json.dumps(last_msg, indent=2)
+                return content if isinstance(content, str) else json.dumps(last_msg, indent=2)
+            return json.dumps({"message": "No assistant response received", "raw": messages_payload}, indent=2)
 
     @ai_function(
         name="get_fabric_item_definition",
@@ -688,20 +773,26 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
 
     @ai_function(
         name="get_semantic_model_metadata",
-        description="Get table and column metadata for a Fabric semantic model. Call this before writing DAX.",
+        description="Get table, column, measure, relationship, and AI instruction metadata for a Fabric semantic model. Call this before writing DAX.",
     )
     async def get_semantic_model_metadata(workspace_id: str, semantic_model_id: str) -> str:
         if not _can_query_semantic_model(workspace_id, semantic_model_id):
             return json.dumps({"error": "That semantic model is not configured for this agent project."})
         dataset_url = f"{POWERBI_API}/groups/{workspace_id}/datasets/{semantic_model_id}"
         async with aiohttp.ClientSession() as session:
+            # Primary: getDefinition (single call, richest metadata)
+            definition_result = await _semantic_model_tables_from_fabric_definition(session, workspace_id, semantic_model_id, fabric_token)
+            if definition_result.get("value"):
+                result: dict[str, Any] = {"workspace_id": workspace_id, "semantic_model_id": semantic_model_id, "tables": definition_result}
+                if definition_result.get("relationships"):
+                    result["relationships"] = definition_result.pop("relationships")
+                if definition_result.get("ai_instructions"):
+                    result["ai_instructions"] = definition_result.pop("ai_instructions")
+                return json.dumps(result, indent=2)
+            # Fallback: DAX INFO queries (needs Build/XMLA permission)
             tables = await _semantic_model_tables_from_dax(session, dataset_url, effective_powerbi_token)
             if tables.get("errors"):
                 tables = await _get_json(session, f"{dataset_url}/tables", _powerbi_headers(effective_powerbi_token))
-            if tables.get("errors"):
-                definition_tables = await _semantic_model_tables_from_fabric_definition(session, workspace_id, semantic_model_id, fabric_token)
-                if definition_tables.get("value") or definition_tables.get("errors"):
-                    tables = definition_tables
         return json.dumps({"workspace_id": workspace_id, "semantic_model_id": semantic_model_id, "tables": tables}, indent=2)
 
     @ai_function(
@@ -751,7 +842,7 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
         instructions=instructions,
         name=project.get("name", "Fabric Agent"),
         description=project.get("description", "A Fabric data agent."),
-        tools=tools,
+        tools=[tool_wrapper(t) for t in tools] if tool_wrapper else tools,
     )
 
 
@@ -856,6 +947,82 @@ async def _run_agent(project: dict[str, Any], message: str, fabric_token: str, c
     except Exception as exc:
         logger.exception("Agent run failed")
         return f"[Agent execution error: {exc}]"
+
+
+async def _run_agent_traced(project: dict[str, Any], message: str, fabric_token: str, conversation_id: str, powerbi_token: str | None = None) -> dict[str, Any]:
+    """Run agent locally with full tool-call tracing for Dev UI."""
+    import logging
+    logger = logging.getLogger("hosted_agent_runtime")
+    tool_trace: list[dict[str, Any]] = []
+
+    def _make_wrapper(tool_obj):
+        """Wrap a FunctionTool's invoke method to capture calls for tracing."""
+        tool_name = getattr(tool_obj, "name", None) or "unknown"
+        original_invoke = tool_obj.invoke
+
+        async def _traced_invoke(*args, **kwargs):
+            # Extract the actual tool arguments from the SDK's invoke signature
+            tool_args = kwargs.get("arguments")
+            if hasattr(tool_args, "model_dump"):
+                tool_args = tool_args.model_dump()
+            elif hasattr(tool_args, "dict"):
+                tool_args = tool_args.dict()
+            elif not isinstance(tool_args, dict):
+                tool_args = dict(tool_args) if tool_args else {}
+
+            start = time.time()
+            try:
+                result = await original_invoke(*args, **kwargs)
+                elapsed = round(time.time() - start, 2)
+                # Extract text from Content objects returned by invoke()
+                if isinstance(result, list):
+                    texts = [getattr(item, "text", None) for item in result if getattr(item, "text", None)]
+                    result_str = "\n".join(texts) if texts else str(result)
+                else:
+                    result_str = str(result) if result is not None else ""
+                result_preview = result_str[:2000] + "..." if len(result_str) > 2000 else result_str
+                tool_trace.append({
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "result_preview": result_preview,
+                    "elapsed_seconds": elapsed,
+                    "status": "success",
+                })
+                return result
+            except Exception as exc:
+                elapsed = round(time.time() - start, 2)
+                tool_trace.append({
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "error": str(exc),
+                    "elapsed_seconds": elapsed,
+                    "status": "error",
+                })
+                raise
+
+        # Monkey-patch the invoke method on the tool object
+        tool_obj.invoke = _traced_invoke
+        return tool_obj
+
+    try:
+        agent = _create_agent(project, fabric_token, powerbi_token, tool_wrapper=_make_wrapper)
+        logger.info("Agent created (traced): mode=%s, tools=%d", project.get("deployment_mode"), len(getattr(agent, "tools", []) or []))
+    except Exception as exc:
+        logger.exception("Failed to create agent")
+        return {"response": f"[Agent creation error: {exc}]", "tool_calls": tool_trace, "error": True}
+
+    thread = _get_or_create_thread(conversation_id)
+    try:
+        if thread is not None:
+            response = await agent.run(message, session=thread)
+        else:
+            response = await agent.run(message)
+        result = _agent_response_text(response)
+        logger.info("Agent traced response length: %d chars, tool_calls: %d", len(result), len(tool_trace))
+        return {"response": result, "tool_calls": tool_trace}
+    except Exception as exc:
+        logger.exception("Agent run failed (traced)")
+        return {"response": f"[Agent execution error: {exc}]", "tool_calls": tool_trace, "error": True}
 
 
 async def _run_agent_sse(project: dict[str, Any], message: str, fabric_token: str, conversation_id: str, powerbi_token: str | None = None):
@@ -1118,14 +1285,22 @@ async def _semantic_model_tables_from_fabric_definition(session: aiohttp.ClientS
         return {"value": [], "errors": payload["errors"], "source": "fabricDefinition"}
     parts = payload.get("definition", {}).get("parts") or payload.get("parts") or []
     tables: list[dict[str, Any]] = []
+    relationships: list[dict[str, Any]] = []
     for part in parts:
         path = str(part.get("path") or "")
-        if path and not path.endswith(".tmdl"):
+        if not path.endswith(".tmdl"):
             continue
         text = _decode_definition_payload(part)
         if text:
             tables.extend(_tables_from_tmdl(text))
-    return {"value": _merge_tables(tables), "source": "fabricDefinition"}
+            relationships.extend(_relationships_from_tmdl(text))
+    ai_instructions = _ai_instructions_from_parts(parts)
+    result: dict[str, Any] = {"value": _merge_tables(tables), "source": "fabricDefinition"}
+    if relationships:
+        result["relationships"] = relationships
+    if ai_instructions:
+        result["ai_instructions"] = ai_instructions
+    return result
 
 
 async def _discover_accessible_fabric_items(fabric_token: str, search_text: str = "", source_type: str = "") -> dict[str, Any]:
@@ -1255,20 +1430,194 @@ def _decode_definition_payload(part: dict[str, Any]) -> str:
 
 
 def _tables_from_tmdl(text: str) -> list[dict[str, Any]]:
+    """Parse TMDL text extracting tables, columns (with types/descriptions), and measures (with expressions/descriptions)."""
     tables: list[dict[str, Any]] = []
+    current_table: dict[str, Any] | None = None
+    current_item: dict[str, Any] | None = None  # current column or measure being parsed
+    item_type: str = ""  # "column" or "measure"
+    indent_stack: int = 0  # track indent level for multi-line expressions
+
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        raw_line = lines[i]
+        stripped = raw_line.strip()
+        indent = len(raw_line) - len(raw_line.lstrip())
+
+        if not stripped or stripped.startswith("//"):
+            i += 1
+            continue
+
+        # Table declaration
+        if stripped.startswith("table "):
+            current_table = {
+                "name": _clean_tmdl_name(stripped.removeprefix("table ")),
+                "description": "",
+                "isHidden": False,
+                "columns": [],
+                "measures": [],
+            }
+            tables.append(current_table)
+            current_item = None
+            item_type = ""
+            i += 1
+            continue
+
+        # Column declaration: "column Name = dataType"
+        if current_table is not None and stripped.startswith("column "):
+            col_def = stripped.removeprefix("column ")
+            # Format: 'Column Name' = DataType  or  ColumnName = DataType
+            parts = re.split(r"\s*=\s*", col_def, maxsplit=1)
+            col_name = parts[0].strip().strip("'").strip('"')
+            data_type = parts[1].strip() if len(parts) > 1 else ""
+            current_item = {"name": col_name, "dataType": data_type, "description": "", "isHidden": False}
+            current_table["columns"].append(current_item)
+            item_type = "column"
+            indent_stack = indent
+            i += 1
+            continue
+
+        # Measure declaration: "measure Name = expression" (may be multi-line with ```)
+        if current_table is not None and stripped.startswith("measure "):
+            meas_def = stripped.removeprefix("measure ")
+            parts = re.split(r"\s*=\s*", meas_def, maxsplit=1)
+            meas_name = parts[0].strip().strip("'").strip('"')
+            expression = parts[1].strip() if len(parts) > 1 else ""
+            # Multi-line expression block
+            if expression == "```" or expression.startswith("```"):
+                expr_lines: list[str] = []
+                if expression != "```":
+                    expr_lines.append(expression.removeprefix("```"))
+                i += 1
+                while i < len(lines):
+                    el = lines[i]
+                    if el.strip() == "```":
+                        i += 1
+                        break
+                    expr_lines.append(el)
+                    i += 1
+                expression = "\n".join(expr_lines).strip()
+            current_item = {"name": meas_name, "expression": expression, "description": "", "isHidden": False}
+            current_table["measures"].append(current_item)
+            item_type = "measure"
+            indent_stack = indent
+            i += 1
+            continue
+
+        # Properties of current item or table
+        if stripped.startswith("description:") or stripped.startswith("description ="):
+            desc_value = re.split(r"[:=]\s*", stripped, maxsplit=1)[-1].strip()
+            # Multi-line description block
+            if desc_value == "```" or desc_value.startswith("```"):
+                desc_lines: list[str] = []
+                if desc_value != "```":
+                    desc_lines.append(desc_value.removeprefix("```"))
+                i += 1
+                while i < len(lines):
+                    dl = lines[i]
+                    if dl.strip() == "```":
+                        i += 1
+                        break
+                    desc_lines.append(dl.strip())
+                    i += 1
+                desc_value = " ".join(desc_lines).strip()
+            else:
+                desc_value = desc_value.strip("'\"")
+            if current_item is not None:
+                current_item["description"] = desc_value
+            elif current_table is not None:
+                current_table["description"] = desc_value
+            i += 1
+            continue
+
+        if stripped.startswith("isHidden"):
+            is_hidden = "true" in stripped.lower()
+            if current_item is not None:
+                current_item["isHidden"] = is_hidden
+            elif current_table is not None:
+                current_table["isHidden"] = is_hidden
+            i += 1
+            continue
+
+        if stripped.startswith("dataType:") or stripped.startswith("dataType ="):
+            dt_value = re.split(r"[:=]\s*", stripped, maxsplit=1)[-1].strip()
+            if current_item is not None and item_type == "column":
+                current_item["dataType"] = dt_value
+            i += 1
+            continue
+
+        if stripped.startswith("expression:") or stripped.startswith("expression ="):
+            expr_val = re.split(r"[:=]\s*", stripped, maxsplit=1)[-1].strip()
+            if expr_val == "```" or expr_val.startswith("```"):
+                expr_lines2: list[str] = []
+                if expr_val != "```":
+                    expr_lines2.append(expr_val.removeprefix("```"))
+                i += 1
+                while i < len(lines):
+                    el2 = lines[i]
+                    if el2.strip() == "```":
+                        i += 1
+                        break
+                    expr_lines2.append(el2)
+                    i += 1
+                expr_val = "\n".join(expr_lines2).strip()
+            if current_item is not None and item_type == "measure":
+                current_item["expression"] = expr_val
+            i += 1
+            continue
+
+        i += 1
+    return tables
+
+
+def _relationships_from_tmdl(text: str) -> list[dict[str, Any]]:
+    """Parse TMDL relationship definitions."""
+    relationships: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
     for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("//"):
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("//"):
             continue
-        if line.startswith("table "):
-            current = {"name": _clean_tmdl_name(line.removeprefix("table ")), "columns": [], "measures": []}
-            tables.append(current)
-        elif current is not None and line.startswith("column "):
-            current["columns"].append({"name": _clean_tmdl_name(line.removeprefix("column "))})
-        elif current is not None and line.startswith("measure "):
-            current["measures"].append({"name": _clean_tmdl_name(line.removeprefix("measure "))})
-    return tables
+        if stripped.startswith("relationship "):
+            current = {"name": _clean_tmdl_name(stripped.removeprefix("relationship "))}
+            relationships.append(current)
+        elif current is not None:
+            if stripped.startswith("fromColumn:") or stripped.startswith("fromColumn ="):
+                current["fromColumn"] = re.split(r"[:=]\s*", stripped, maxsplit=1)[-1].strip().strip("'\"")
+            elif stripped.startswith("toColumn:") or stripped.startswith("toColumn ="):
+                current["toColumn"] = re.split(r"[:=]\s*", stripped, maxsplit=1)[-1].strip().strip("'\"")
+            elif stripped.startswith("fromTable:") or stripped.startswith("fromTable ="):
+                current["fromTable"] = re.split(r"[:=]\s*", stripped, maxsplit=1)[-1].strip().strip("'\"")
+            elif stripped.startswith("toTable:") or stripped.startswith("toTable ="):
+                current["toTable"] = re.split(r"[:=]\s*", stripped, maxsplit=1)[-1].strip().strip("'\"")
+            elif stripped.startswith("fromCardinality:") or stripped.startswith("fromCardinality ="):
+                current["fromCardinality"] = re.split(r"[:=]\s*", stripped, maxsplit=1)[-1].strip().strip("'\"")
+            elif stripped.startswith("toCardinality:") or stripped.startswith("toCardinality ="):
+                current["toCardinality"] = re.split(r"[:=]\s*", stripped, maxsplit=1)[-1].strip().strip("'\"")
+            elif stripped.startswith("crossFilteringBehavior:") or stripped.startswith("crossFilteringBehavior ="):
+                current["crossFilteringBehavior"] = re.split(r"[:=]\s*", stripped, maxsplit=1)[-1].strip().strip("'\"")
+    return relationships
+
+
+def _ai_instructions_from_parts(parts: list[dict[str, Any]]) -> str:
+    """Extract AI instructions / linguistic schema from definition parts."""
+    for part in parts:
+        path = str(part.get("path") or "")
+        # Look for linguistic schema or AI instructions annotation parts
+        if "linguisticSchema" in path.lower() or "linguistic" in path.lower():
+            text = _decode_definition_payload(part)
+            if text:
+                return text
+    # Also check model.tmdl for __PBI_AIInstructions annotation
+    for part in parts:
+        path = str(part.get("path") or "")
+        if path.endswith("model.tmdl") or path == "model.tmdl":
+            text = _decode_definition_payload(part)
+            if text:
+                match = re.search(r"annotation\s+__PBI_AIInstructions\s*=\s*```(.*?)```", text, re.DOTALL)
+                if match:
+                    return match.group(1).strip()
+    return ""
 
 
 def _clean_tmdl_name(value: str) -> str:
@@ -1282,7 +1631,11 @@ def _merge_tables(tables: list[dict[str, Any]]) -> list[dict[str, Any]]:
         name = table.get("name")
         if not name:
             continue
-        target = merged.setdefault(name, {"name": name, "columns": [], "measures": []})
+        if name not in merged:
+            merged[name] = {"name": name, "description": table.get("description", ""), "isHidden": table.get("isHidden", False), "columns": [], "measures": []}
+        target = merged[name]
+        if not target.get("description") and table.get("description"):
+            target["description"] = table["description"]
         target["columns"].extend(table.get("columns", []))
         target["measures"].extend(table.get("measures", []))
     return list(merged.values())

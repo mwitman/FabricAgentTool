@@ -175,6 +175,10 @@ async def save_project(project_id: str, project: AgentProject):
 async def delete_project(project_id: str):
     try:
         await run_in_threadpool(lambda: _store().delete_project(project_id))
+        # Cascade: remove the agent role binding associated with this project
+        binding = await run_in_threadpool(lambda: _perms().get_agent_binding_by_project(project_id))
+        if binding:
+            await run_in_threadpool(lambda: _perms().delete_agent_binding(binding.id))
         return {"status": "deleted", "project_id": project_id}
     except Exception as exc:
         return _project_store_error(exc)
@@ -263,6 +267,95 @@ async def dev_chat_endpoint(request: DevChatRequest):
     history.extend([{"role": "user", "content": request.message}, {"role": "assistant", "content": result["response"]}])
     del history[:-12]
     return result
+
+
+@app.post("/api/dev/chat-local")
+async def dev_chat_local_endpoint(request: DevChatRequest):
+    """Run the hosted agent runtime logic locally (in-process) with full tool-call tracing."""
+    history = _dev_history.setdefault(request.conversation_id, [])
+    try:
+        result = await _local_dev_chat(request, history)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    history.extend([{"role": "user", "content": request.message}, {"role": "assistant", "content": result["response"]}])
+    del history[:-12]
+    return result
+
+
+async def _local_dev_chat(request: DevChatRequest, history: list[dict[str, str]]) -> dict[str, Any]:
+    """Execute the agent locally using the hosted_agent_runtime module with tracing."""
+    import sys
+    import importlib
+
+    project = request.project
+    if not request.fabric_token or not request.powerbi_token:
+        raise ValueError("Sign in so Dev UI can pass delegated Fabric and Power BI tokens to the hosted agent.")
+
+    # Build enriched message with history
+    enriched_message = request.message
+    if history:
+        lines = []
+        for item in history[-12:]:
+            role = item.get("role", "message").title()
+            content = item.get("content", "").strip()
+            if content:
+                lines.append(f"{role}: {content}")
+        if lines:
+            enriched_message = f"[Conversation so far]\n{chr(10).join(lines)}\n\n[Current user message]\n{request.message}"
+
+    trace: list[dict[str, Any]] = [
+        {"step": "request", "status": "complete", "detail": request.message},
+        {"step": "local_agent", "status": "complete", "detail": "Running agent locally (in-process) with tool-call tracing enabled."},
+        {"step": "tokens", "status": "complete", "detail": "Passing signed-in user Fabric and Power BI delegated tokens to the local agent."},
+    ]
+
+    # Import and run the traced agent from hosted_agent_runtime
+    runtime_path = str(APP_ROOT / "hosted_agent_runtime")
+    if runtime_path not in sys.path:
+        sys.path.insert(0, runtime_path)
+    try:
+        from hosted_agent_runtime.app import _run_agent_traced
+    except ImportError:
+        # Try relative import for different module resolution
+        spec = importlib.util.spec_from_file_location("hosted_agent_runtime.app", str(APP_ROOT / "hosted_agent_runtime" / "app.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _run_agent_traced = mod._run_agent_traced
+
+    # Set up environment for the runtime (it reads tokens from env/params)
+    # by_alias=True ensures "semantic_model" key is used (not the Python field name "data_source")
+    project_dict = project.model_dump(mode="json", by_alias=True) if hasattr(project, "model_dump") else project.dict(by_alias=True) if hasattr(project, "dict") else dict(project)
+
+    result = await _run_agent_traced(
+        project=project_dict,
+        message=enriched_message,
+        fabric_token=request.fabric_token,
+        conversation_id=request.conversation_id,
+        powerbi_token=request.powerbi_token,
+    )
+
+    # Add tool call traces
+    for tc in result.get("tool_calls", []):
+        status = "complete" if tc.get("status") == "success" else "failed"
+        detail = f"Tool: {tc.get('tool')} ({tc.get('elapsed_seconds', '?')}s)"
+        data: dict[str, Any] = {"tool": tc.get("tool"), "args": tc.get("args")}
+        if tc.get("result_preview"):
+            data["result"] = tc["result_preview"]
+        if tc.get("error"):
+            data["error"] = tc["error"]
+        trace.append({"step": "tool_call", "status": status, "detail": detail, "data": data})
+
+    trace.append({"step": "response", "status": "complete", "detail": f"Agent returned {len(result.get('response', ''))} chars."})
+
+    return {
+        "response": result.get("response") or "No response",
+        "debug": {
+            "mode": "local",
+            "selected_agent": project.name if hasattr(project, "name") else project_dict.get("name", ""),
+            "trace": trace,
+            "tool_calls": result.get("tool_calls", []),
+        },
+    }
 
 
 async def _hosted_dev_chat(request: DevChatRequest, history: list[dict[str, str]]) -> dict[str, Any]:
@@ -356,6 +449,10 @@ async def deploy_submit_foundry(request: DeploymentRequest):
         env_vars: dict[str, str] = {"MAF_MGMT_PROJECT_ID": saved_project.id}
         if _model_deployment:
             env_vars["model_deployment_name"] = _model_deployment
+            env_vars["AZURE_OPENAI_DEPLOYMENT_NAME"] = _model_deployment
+        elif os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME"):
+            env_vars["model_deployment_name"] = os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"]
+            env_vars["AZURE_OPENAI_DEPLOYMENT_NAME"] = os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"]
         # Add a deployment nonce so Foundry always creates a new version
         env_vars["project_deployed_at"] = datetime.now(timezone.utc).isoformat()
         result = await create_hosted_agent_version(
