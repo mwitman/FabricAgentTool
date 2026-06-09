@@ -896,11 +896,12 @@ async def responses(request: Request):
     powerbi_token = body.get("powerbi_token") or body.get("metadata", {}).get("powerbi_token")
 
     if not fabric_token:
-        # Fallback: acquire a Fabric token using the service principal credential
+        # Fallback: acquire tokens using the service principal credential
         try:
             cred = _credential()
-            token_obj = cred.get_token("https://api.fabric.microsoft.com/.default")
-            fabric_token = token_obj.token
+            fabric_token = cred.get_token("https://api.fabric.microsoft.com/.default").token
+            if not powerbi_token:
+                powerbi_token = cred.get_token("https://analysis.windows.net/powerbi/api/.default").token
         except Exception:
             pass
 
