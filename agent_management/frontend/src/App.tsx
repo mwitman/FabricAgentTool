@@ -983,7 +983,7 @@ export default function App() {
                 };
                 const readable = (data: any) => JSON.stringify(parseJsonStrings(data), null, 2).replace(/\\n/g, "\n").replace(/\\"/g, '"');
                 return <div className="trace-step" key={`${step.step}-${index}`}>
-                  <div><strong>{step.step}</strong><span>{step.status}</span></div>
+                  <div><strong>{step.step}</strong><span>{step.status}</span>{(step as any).timestamp ? <span className="trace-ts">{new Date((step as any).timestamp).toLocaleTimeString()}</span> : null}</div>
                   <p>{step.detail}</p>
                   {step.data ? <pre>{readable(step.data)}</pre> : null}
                 </div>;

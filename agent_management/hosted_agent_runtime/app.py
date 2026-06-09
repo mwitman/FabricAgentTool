@@ -14,6 +14,7 @@ import base64
 import asyncio
 import time
 import uuid
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
 from urllib.parse import urljoin
@@ -789,10 +790,23 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
                 if definition_result.get("ai_instructions"):
                     result["ai_instructions"] = definition_result.pop("ai_instructions")
                 return json.dumps(result, indent=2)
+            definition_errors = definition_result.get("errors", [])
             # Fallback: DAX INFO queries (needs Build/XMLA permission)
             tables = await _semantic_model_tables_from_dax(session, dataset_url, effective_powerbi_token)
             if tables.get("errors"):
+                dax_errors = tables.get("errors", [])
                 tables = await _get_json(session, f"{dataset_url}/tables", _powerbi_headers(effective_powerbi_token))
+                # If REST API also returned no useful data, include diagnostics
+                if not tables.get("value"):
+                    diagnostics: list[dict[str, Any]] = []
+                    if definition_errors:
+                        diagnostics.append({"source": "getDefinition", "errors": definition_errors})
+                    if dax_errors:
+                        diagnostics.append({"source": "executeQueries_DAX", "errors": dax_errors})
+                    if tables.get("error") or tables.get("errors"):
+                        diagnostics.append({"source": "REST_tables", "errors": tables.get("errors") or [tables.get("error")]})
+                    if diagnostics:
+                        tables["_diagnostics"] = diagnostics
         return json.dumps({"workspace_id": workspace_id, "semantic_model_id": semantic_model_id, "tables": tables}, indent=2)
 
     @ai_function(
@@ -971,6 +985,7 @@ async def _run_agent_traced(project: dict[str, Any], message: str, fabric_token:
                 tool_args = dict(tool_args) if tool_args else {}
 
             start = time.time()
+            started_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
             try:
                 result = await original_invoke(*args, **kwargs)
                 elapsed = round(time.time() - start, 2)
@@ -987,6 +1002,7 @@ async def _run_agent_traced(project: dict[str, Any], message: str, fabric_token:
                     "result_preview": result_preview,
                     "elapsed_seconds": elapsed,
                     "status": "success",
+                    "timestamp": started_at,
                 })
                 return result
             except Exception as exc:
@@ -997,6 +1013,7 @@ async def _run_agent_traced(project: dict[str, Any], message: str, fabric_token:
                     "error": str(exc),
                     "elapsed_seconds": elapsed,
                     "status": "error",
+                    "timestamp": started_at,
                 })
                 raise
 
@@ -1244,8 +1261,11 @@ async def _post_json(session: aiohttp.ClientSession, url: str, headers: dict[str
             payload = json.loads(text) if text else {}
         except json.JSONDecodeError:
             payload = {"raw": text}
-        if response.status == 202 and response.headers.get("Location"):
-            return await _poll_fabric_operation(session, response.headers["Location"], headers)
+        if response.status == 202:
+            location = response.headers.get("Location") or response.headers.get("Operation-Location") or payload.get("operationUrl") or payload.get("location")
+            if location:
+                return await _poll_fabric_operation(session, location, headers)
+            return {"errors": [{"status": 202, "url": url, "message": "Accepted but no operation URL returned", "body": payload}]}
         if response.status >= 400:
             return {"errors": [{"status": response.status, "url": url, "message": payload}]}
         return payload

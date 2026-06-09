@@ -343,7 +343,10 @@ async def _local_dev_chat(request: DevChatRequest, history: list[dict[str, str]]
             data["result"] = tc["result_preview"]
         if tc.get("error"):
             data["error"] = tc["error"]
-        trace.append({"step": "tool_call", "status": status, "detail": detail, "data": data})
+        entry: dict[str, Any] = {"step": "tool_call", "status": status, "detail": detail, "data": data}
+        if tc.get("timestamp"):
+            entry["timestamp"] = tc["timestamp"]
+        trace.append(entry)
 
     trace.append({"step": "response", "status": "complete", "detail": f"Agent returned {len(result.get('response', ''))} chars."})
 
