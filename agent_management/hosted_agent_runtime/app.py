@@ -896,7 +896,16 @@ async def responses(request: Request):
     powerbi_token = body.get("powerbi_token") or body.get("metadata", {}).get("powerbi_token")
 
     if not fabric_token:
-        error_text = "A Fabric bearer token is required. The custom UX supplies this token, but the Foundry playground does not."
+        # Fallback: acquire a Fabric token using the service principal credential
+        try:
+            cred = _credential()
+            token_obj = cred.get_token("https://api.fabric.microsoft.com/.default")
+            fabric_token = token_obj.token
+        except Exception:
+            pass
+
+    if not fabric_token:
+        error_text = "A Fabric bearer token is required. The custom UX supplies this token, but the Foundry playground does not, and the service principal fallback failed."
         if body.get("stream") is True:
             return StreamingResponse(_stream_sse(error_text, conversation_id), media_type="text/event-stream")
         return _responses_payload(error_text, conversation_id, project)
