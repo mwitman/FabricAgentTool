@@ -202,7 +202,7 @@ export default function App() {
       setProjects(loadedProjects);
       setDevProjectId((current) => {
         if (current && loadedProjects.some((candidate: AgentProject) => candidate.id === current)) return current;
-        return loadedProjects[0]?.id ?? "";
+        return "";
       });
       setStatus(`Loaded ${loadedProjects.length} projects`);
     } catch (error: any) {
@@ -677,7 +677,7 @@ export default function App() {
         <nav>
           <button className={activeTab === "projects" ? "nav-tab active" : "nav-tab"} onClick={() => setActiveTab("projects")}><FolderOpen size={16} /> Projects</button>
           {isAdmin ? <button className={activeTab === "roles" ? "nav-tab active" : "nav-tab"} onClick={() => setActiveTab("roles")}><Shield size={16} /> Roles</button> : null}
-          {canCreateProjects ? <button className={activeTab === "dev" ? "nav-tab active" : "nav-tab"} onClick={() => setActiveTab("dev")}><FlaskConical size={16} /> Dev UI</button> : null}
+          {canCreateProjects ? <button className={activeTab === "dev" ? "nav-tab active" : "nav-tab"} onClick={() => { setDevProjectId(""); setDevChatHistory([]); setDevTrace([]); setDevDebug(null); setDevResponse(""); setActiveTab("dev"); }}><FlaskConical size={16} /> Dev UI</button> : null}
         </nav>
         <div className="sidebar-footer">
           <button className="theme-toggle" onClick={() => setDarkMode((current) => !current)}>

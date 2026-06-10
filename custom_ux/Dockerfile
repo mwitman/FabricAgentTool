@@ -4,6 +4,10 @@
 FROM node:20-alpine AS frontend-build
 
 WORKDIR /app/frontend
+ARG VITE_ENTRA_CLIENT_ID
+ARG VITE_ENTRA_TENANT_ID
+ENV VITE_ENTRA_CLIENT_ID=$VITE_ENTRA_CLIENT_ID
+ENV VITE_ENTRA_TENANT_ID=$VITE_ENTRA_TENANT_ID
 COPY frontend/package.json frontend/package-lock.json* ./
 RUN npm install
 COPY frontend/ ./
@@ -35,3 +39,4 @@ EXPOSE 8080
 
 # Run
 CMD ["python", "-m", "uvicorn", "backend.server:app", "--host", "0.0.0.0", "--port", "8080"]
+ 

@@ -13,8 +13,10 @@ FROM python:3.12-slim
 WORKDIR /app
 ENV PORT=8091 PYTHONUNBUFFERED=1
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY hosted_agent_runtime/requirements.txt ./hosted_agent_runtime.requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && pip install --no-cache-dir -r hosted_agent_runtime.requirements.txt
 COPY backend/ ./backend/
+COPY hosted_agent_runtime/ ./hosted_agent_runtime/
 COPY --from=frontend /src/backend/static ./backend/static
 EXPOSE 8091
 CMD ["python", "-m", "uvicorn", "backend.server:app", "--host", "0.0.0.0", "--port", "8091"]
