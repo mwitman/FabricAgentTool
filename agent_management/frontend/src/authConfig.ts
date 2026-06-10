@@ -23,5 +23,5 @@ export const msalConfig: Configuration = {
 };
 
 export const loginRequest = { scopes: ["openid", "profile", "offline_access"] };
-export const fabricTokenRequest = { scopes: ["https://api.fabric.microsoft.com/Workspace.Read.All", "https://api.fabric.microsoft.com/Item.ReadWrite.All"] };
+export const fabricTokenRequest = { scopes: ["https://api.fabric.microsoft.com/Workspace.Read.All", "https://api.fabric.microsoft.com/Item.Read.All"] };
 export const powerBiTokenRequest = { scopes: ["https://analysis.windows.net/powerbi/api/Dataset.Read.All"] };

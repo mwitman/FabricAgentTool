@@ -61,7 +61,34 @@ except ImportError:
 
 load_dotenv()
 
+# ── OpenTelemetry / Azure Monitor tracing ─────────────────────────────────────
+_appinsights_conn = os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING", "")
+if _appinsights_conn:
+    try:
+        from opentelemetry import trace
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from azure.monitor.opentelemetry.exporter import AzureMonitorTraceExporter
+
+        _provider = TracerProvider()
+        _provider.add_span_processor(BatchSpanProcessor(AzureMonitorTraceExporter(connection_string=_appinsights_conn)))
+        trace.set_tracer_provider(_provider)
+
+        # Instrument FastAPI if available
+        try:
+            from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+            _fastapi_instrumentor = FastAPIInstrumentor()
+        except ImportError:
+            _fastapi_instrumentor = None
+    except Exception:
+        _fastapi_instrumentor = None
+else:
+    _fastapi_instrumentor = None
+
 app = FastAPI(title="Hosted Agent Runtime")
+
+if _fastapi_instrumentor:
+    _fastapi_instrumentor.instrument_app(app)
 
 FABRIC_API = "https://api.fabric.microsoft.com/v1"
 FABRIC_API_ROOT = "https://api.fabric.microsoft.com"
