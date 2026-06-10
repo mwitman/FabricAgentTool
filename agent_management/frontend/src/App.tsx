@@ -102,7 +102,7 @@ export default function App() {
   const savedProjectSnapshot = useRef<string>(JSON.stringify(newProject()));
   const subagentAddTimeout = useRef<number | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
-  const conversationId = useMemo(() => crypto.randomUUID(), []);
+  const [conversationId, setConversationId] = useState(() => crypto.randomUUID());
   const currentUserObjectId = useMemo(() => {
     const claims = account?.idTokenClaims as any;
     return claims?.oid || account?.localAccountId || "";
@@ -250,6 +250,8 @@ export default function App() {
       setProject(cleanProject);
       savedProjectSnapshot.current = JSON.stringify(cleanProject);
       setDevProjectId(fullProject.id ?? "");
+      setConversationId(crypto.randomUUID());
+      setDevChatHistory([]);
       setDeployment(cleanDeployment(fullProject.deployment));
       setDeploymentUiState("idle");
       setDeploymentMessage("");
@@ -466,6 +468,8 @@ export default function App() {
       setProject(cleanProject);
       savedProjectSnapshot.current = JSON.stringify(cleanProject);
       setDevProjectId(saved.id ?? "");
+      setConversationId(crypto.randomUUID());
+      setDevChatHistory([]);
       setDeployment(cleanDeployment(saved.deployment));
       await loadProjects();
       setStatus("Project saved");
@@ -677,7 +681,7 @@ export default function App() {
         <nav>
           <button className={activeTab === "projects" ? "nav-tab active" : "nav-tab"} onClick={() => setActiveTab("projects")}><FolderOpen size={16} /> Projects</button>
           {isAdmin ? <button className={activeTab === "roles" ? "nav-tab active" : "nav-tab"} onClick={() => setActiveTab("roles")}><Shield size={16} /> Roles</button> : null}
-          {canCreateProjects ? <button className={activeTab === "dev" ? "nav-tab active" : "nav-tab"} onClick={() => { setDevProjectId(""); setDevChatHistory([]); setDevTrace([]); setDevDebug(null); setDevResponse(""); setActiveTab("dev"); }}><FlaskConical size={16} /> Dev UI</button> : null}
+          {canCreateProjects ? <button className={activeTab === "dev" ? "nav-tab active" : "nav-tab"} onClick={() => { setDevProjectId(""); setDevChatHistory([]); setDevTrace([]); setDevDebug(null); setDevResponse(""); setConversationId(crypto.randomUUID()); setActiveTab("dev"); }}><FlaskConical size={16} /> Dev UI</button> : null}
         </nav>
         <div className="sidebar-footer">
           <button className="theme-toggle" onClick={() => setDarkMode((current) => !current)}>
@@ -937,7 +941,7 @@ export default function App() {
         </section> : <section className="dev-layout" id="dev">
           <div className="panel dev-console">
             <div className="section-header"><h2>Agent Dev UI</h2>{devProject ? <span className="badge">{devProject.deployment_mode}</span> : null}{devRunLocal ? <span className="badge">local</span> : <span className="badge">deployed</span>}</div>
-            <label>Project to test<select value={devProjectId} onChange={(event) => { setDevProjectId(event.target.value); setDevChatHistory([]); setDevTrace([]); setDevDebug(null); setDevResponse(""); }}><option value="">Select project</option>{visibleProjects.map((savedProject) => <option value={savedProject.id ?? ""} key={savedProject.id ?? savedProject.name}>{savedProject.name}</option>)}</select></label>
+            <label>Project to test<select value={devProjectId} onChange={(event) => { setDevProjectId(event.target.value); setDevChatHistory([]); setDevTrace([]); setDevDebug(null); setDevResponse(""); setConversationId(crypto.randomUUID()); }}><option value="">Select project</option>{visibleProjects.map((savedProject) => <option value={savedProject.id ?? ""} key={savedProject.id ?? savedProject.name}>{savedProject.name}</option>)}</select></label>
             <label className="toggle-label"><input type="checkbox" checked={devRunLocal} onChange={(e) => setDevRunLocal(e.target.checked)} /> Run locally (full tool tracing, no Foundry deployment needed)</label>
             {devProject ? <div className="project-test-summary"><strong>{devProject.name}</strong><span>{devProjectAgentCount} agent{devProjectAgentCount === 1 ? "" : "s"}</span><p>{devProject.description || "No description"}</p></div> : null}
             <div className="dev-chat-history">
