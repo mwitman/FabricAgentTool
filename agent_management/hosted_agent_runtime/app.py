@@ -61,34 +61,32 @@ except ImportError:
 
 load_dotenv()
 
-# ── OpenTelemetry / Azure Monitor tracing ─────────────────────────────────────
+# ── Observability / Tracing ───────────────────────────────────────────────────
 _appinsights_conn = os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING", "")
-if _appinsights_conn:
-    try:
-        from opentelemetry import trace
-        from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import BatchSpanProcessor
-        from azure.monitor.opentelemetry.exporter import AzureMonitorTraceExporter
+try:
+    from agent_framework.observability import OBSERVABILITY_SETTINGS
 
-        _provider = TracerProvider()
-        _provider.add_span_processor(BatchSpanProcessor(AzureMonitorTraceExporter(connection_string=_appinsights_conn)))
-        trace.set_tracer_provider(_provider)
+    additional_exporters = []
+    if _appinsights_conn:
+        from azure.monitor.opentelemetry.exporter import AzureMonitorTraceExporter, AzureMonitorLogExporter, AzureMonitorMetricExporter
+        additional_exporters.append(AzureMonitorTraceExporter(connection_string=_appinsights_conn))
+        additional_exporters.append(AzureMonitorLogExporter(connection_string=_appinsights_conn))
+        additional_exporters.append(AzureMonitorMetricExporter(connection_string=_appinsights_conn))
 
-        # Instrument FastAPI if available
-        try:
-            from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-            _fastapi_instrumentor = FastAPIInstrumentor()
-        except ImportError:
-            _fastapi_instrumentor = None
-    except Exception:
-        _fastapi_instrumentor = None
-else:
-    _fastapi_instrumentor = None
+    OBSERVABILITY_SETTINGS.enable_sensitive_data = True
+    OBSERVABILITY_SETTINGS._configure(additional_exporters=additional_exporters if additional_exporters else None)
+
+    # Also attach the OTel log handler to the root logger so all app logs go to traces table
+    if _appinsights_conn:
+        import logging as _logging
+        from opentelemetry._logs import get_logger_provider
+        from opentelemetry.sdk._logs import LoggingHandler
+        _otel_handler = LoggingHandler(logger_provider=get_logger_provider())
+        _logging.getLogger().addHandler(_otel_handler)
+except Exception:
+    pass
 
 app = FastAPI(title="Hosted Agent Runtime")
-
-if _fastapi_instrumentor:
-    _fastapi_instrumentor.instrument_app(app)
 
 FABRIC_API = "https://api.fabric.microsoft.com/v1"
 FABRIC_API_ROOT = "https://api.fabric.microsoft.com"

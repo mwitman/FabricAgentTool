@@ -43,7 +43,7 @@ export const loginRequest = {
 
 /** Scopes for acquiring a Fabric API access token. */
 export const fabricTokenRequest = {
-  scopes: ["https://api.fabric.microsoft.com/Workspace.Read.All", "https://api.fabric.microsoft.com/Item.Read.All"],
+  scopes: ["https://api.fabric.microsoft.com/Workspace.Read.All", "https://api.fabric.microsoft.com/Item.ReadWrite.All"],
 };
 
 /** Scopes for executing DAX queries against Power BI/Fabric semantic models. */

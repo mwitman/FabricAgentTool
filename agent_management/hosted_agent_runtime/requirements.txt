@@ -16,4 +16,3 @@ aiohttp>=3.11.0
 # Tracing (Azure Monitor / Application Insights)
 azure-monitor-opentelemetry-exporter>=1.0.0b30
 opentelemetry-sdk>=1.25.0
-opentelemetry-instrumentation-fastapi>=0.46b0
