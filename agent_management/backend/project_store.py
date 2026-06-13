@@ -11,6 +11,23 @@ from azure.identity import AzureCliCredential, ClientSecretCredential, DefaultAz
 
 from .models import AgentProject
 
+# Keys whose values must never be persisted to Cosmos
+_SENSITIVE_ENV_KEYS = {"APP_CLIENT_SECRET", "AZURE_CLIENT_SECRET", "CLIENT_SECRET", "SECRET"}
+
+
+def _strip_secrets(obj: Any) -> None:
+    """Recursively remove sensitive keys from environment_variables dicts."""
+    if isinstance(obj, dict):
+        if "environment_variables" in obj and isinstance(obj["environment_variables"], dict):
+            for key in list(obj["environment_variables"].keys()):
+                if key.upper() in _SENSITIVE_ENV_KEYS or "SECRET" in key.upper():
+                    del obj["environment_variables"][key]
+        for value in obj.values():
+            _strip_secrets(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            _strip_secrets(item)
+
 
 class ProjectStore:
     def list_projects(self) -> list[dict[str, Any]]:
@@ -53,6 +70,7 @@ class CosmosProjectStore(ProjectStore):
         project.touch()
         item = project.model_dump(mode="json", by_alias=True)
         item[self.partition_field] = project.id
+        _strip_secrets(item)
         self.container.upsert_item(item)
         return project
 
@@ -116,3 +134,70 @@ def _cosmos_credential():
     if tenant_id and client_id and client_secret:
         return ClientSecretCredential(tenant_id=tenant_id, client_id=client_id, client_secret=client_secret)
     return DefaultAzureCredential(exclude_interactive_browser_credential=True)
+
+
+# ---------------------------------------------------------------------------
+# Version Store — immutable deployment snapshots
+# ---------------------------------------------------------------------------
+
+
+class VersionStore:
+    """Stores immutable version snapshots of projects keyed by projectid + version."""
+
+    def __init__(self) -> None:
+        endpoint = os.environ.get("AGENT_MGMT_COSMOS_ENDPOINT", "").strip()
+        if not endpoint:
+            raise RuntimeError("AGENT_MGMT_COSMOS_ENDPOINT is required for VersionStore.")
+        database_name = os.environ.get("AGENT_MGMT_COSMOS_DATABASE", "agents")
+        container_name = os.environ.get("AGENT_MGMT_VERSIONS_CONTAINER", "agentversions")
+        credential = _cosmos_credential()
+        client = CosmosClient(endpoint, credential=credential)
+        self.database = client.get_database_client(database_name)
+        self.container = self.database.get_container_client(container_name)
+
+    def save_version(self, project_id: str, version: str, snapshot: dict[str, Any], deployed_by: str = "") -> dict[str, Any]:
+        """Write an immutable version snapshot (secrets stripped)."""
+        from datetime import datetime, timezone
+        import copy
+        clean_snapshot = copy.deepcopy(snapshot)
+        _strip_secrets(clean_snapshot)
+        doc = {
+            "id": f"{project_id}:{version}",
+            "projectid": project_id,
+            "version": version,
+            "snapshot": clean_snapshot,
+            "deployed_at": datetime.now(timezone.utc).isoformat(),
+            "deployed_by": deployed_by,
+        }
+        self.container.upsert_item(doc)
+        return doc
+
+    def get_version(self, project_id: str, version: str) -> dict[str, Any] | None:
+        """Read a specific version snapshot."""
+        try:
+            return self.container.read_item(item=f"{project_id}:{version}", partition_key=project_id)
+        except Exception:
+            return None
+
+    def list_versions(self, project_id: str) -> list[dict[str, Any]]:
+        """List all versions for a project, newest first."""
+        query = "SELECT c.id, c.version, c.deployed_at, c.deployed_by FROM c WHERE c.projectid = @pid ORDER BY c.deployed_at DESC"
+        params = [{"name": "@pid", "value": project_id}]
+        return list(self.container.query_items(query=query, parameters=params, partition_key=project_id))
+
+    def delete_version(self, project_id: str, version: str) -> None:
+        """Delete a version snapshot."""
+        try:
+            self.container.delete_item(item=f"{project_id}:{version}", partition_key=project_id)
+        except Exception:
+            pass
+
+
+_version_store: VersionStore | None = None
+
+
+def get_version_store() -> VersionStore:
+    global _version_store
+    if _version_store is None:
+        _version_store = VersionStore()
+    return _version_store

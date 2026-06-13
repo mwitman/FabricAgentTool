@@ -27,3 +27,7 @@ venv/
 .DS_Store
 Thumbs.db
 .vscode/
+
+# Local data (projects/permissions stored in Cosmos)
+agent_management/backend/data/projects/*.json
+agent_management/backend/data/permissions/*.json

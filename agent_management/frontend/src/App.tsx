@@ -63,7 +63,7 @@ function shouldUsePopupFallback(error: any) {
 
 const roleName = (name: string) => name.trim().toLowerCase();
 const isAdminRoleName = (name: string) => ["admin", "admins"].includes(roleName(name));
-const isAgentCreatorRoleName = (name: string) => roleName(name) === "agent creators";
+const isDeveloperRoleName = (name: string) => roleName(name) === "developer";
 
 export default function App() {
   const { instance, accounts } = useMsal();
@@ -98,6 +98,9 @@ export default function App() {
   const [deployedAgents, setDeployedAgents] = useState<ExternalAgentRef[]>([]);
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem("agentManagementTheme") === "dark");
   const [currentUserGroupIds, setCurrentUserGroupIds] = useState<string[]>([]);
+  const [projectVersions, setProjectVersions] = useState<Array<{ version: string; deployed_at: string; deployed_by?: string }>>([]);
+  const [selectedVersion, setSelectedVersion] = useState<string | null>(null);
+  const [viewingVersionSnapshot, setViewingVersionSnapshot] = useState(false);
   const [subagentAddAcknowledged, setSubagentAddAcknowledged] = useState(false);
   const savedProjectSnapshot = useRef<string>(JSON.stringify(newProject()));
   const subagentAddTimeout = useRef<number | null>(null);
@@ -117,11 +120,11 @@ export default function App() {
   }, [roles, currentUserObjectId, currentUserGroupIds]);
   const currentUserRoleIds = useMemo(() => new Set(rolesForCurrentUser.map((role) => role.id).filter(Boolean) as string[]), [rolesForCurrentUser]);
   const isAdmin = useMemo(() => rolesForCurrentUser.some((role) => isAdminRoleName(role.name)), [rolesForCurrentUser]);
-  const isAgentCreator = useMemo(() => rolesForCurrentUser.some((role) => isAgentCreatorRoleName(role.name)), [rolesForCurrentUser]);
-  const canCreateProjects = isAdmin || isAgentCreator;
+  const isDeveloper = useMemo(() => rolesForCurrentUser.some((role) => isDeveloperRoleName(role.name)), [rolesForCurrentUser]);
+  const canCreateProjects = isAdmin || isDeveloper;
   const assignableRoles = useMemo(() => {
     if (isAdmin) return roles;
-    return rolesForCurrentUser.filter((role) => !isAgentCreatorRoleName(role.name));
+    return rolesForCurrentUser.filter((role) => !isDeveloperRoleName(role.name));
   }, [isAdmin, roles, rolesForCurrentUser]);
   const visibleProjects = useMemo(() => {
     if (isAdmin) return projects;
@@ -259,11 +262,58 @@ export default function App() {
       setDevTrace([]);
       setDevDebug(null);
       setActiveTab("create");
+      setSelectedVersion(null);
+      setViewingVersionSnapshot(false);
       setStatus(`Opened ${fullProject.name}`);
+      // Load version history
+      loadVersions(selectedProjectId);
     } catch (error: any) {
       setStatus(`Open failed: ${error.message}`);
     } finally {
       setOpeningProjectId(null);
+    }
+  };
+
+  const loadVersions = async (projectId: string) => {
+    try {
+      const response = await fetch(`/api/projects/${projectId}/versions`);
+      if (response.ok) {
+        const data = await response.json();
+        setProjectVersions(data.versions || []);
+      } else {
+        setProjectVersions([]);
+      }
+    } catch {
+      setProjectVersions([]);
+    }
+  };
+
+  const switchToVersion = async (version: string) => {
+    if (!project.id) return;
+    try {
+      setStatus(`Loading version ${version}...`);
+      const response = await fetch(`/api/projects/${project.id}/versions/${version}`);
+      const data = await readApiResponse(response);
+      if (data.snapshot) {
+        const versionProject = { ...newProject(), ...data.snapshot, deployment: cleanDeployment(data.snapshot.deployment) ?? {} };
+        setProject(versionProject);
+        setSelectedVersion(version);
+        setViewingVersionSnapshot(true);
+        setStatus(`Viewing version ${version} (read-only snapshot)`);
+      }
+    } catch (error: any) {
+      setStatus(`Failed to load version: ${error.message}`);
+    }
+  };
+
+  const switchToLive = () => {
+    if (!project.id) return;
+    // Re-open the live project from Cosmos
+    const liveProject = projects.find((p) => p.id === project.id);
+    if (liveProject) openProject(liveProject);
+    else {
+      setSelectedVersion(null);
+      setViewingVersionSnapshot(false);
     }
   };
 
@@ -282,7 +332,7 @@ export default function App() {
   const projectDeploymentLabel = (candidate: AgentProject) => {
     if (!projectIsDeployed(candidate)) return "Not deployed";
     const deployment: any = candidate.deployment ?? {};
-    const version = deployment.version || deployment.info?.version || deployment.foundry?.version || deployment.foundry?.info?.version;
+    const version = deployment.info?.version || deployment.version || deployment.foundry?.version || deployment.foundry?.name || deployment.foundry?.info?.version;
     return version ? `Deployed v${String(version).replace(/^v/i, "")}` : "Deployed";
   };
 
@@ -607,6 +657,7 @@ export default function App() {
       setDeployment(nextDeployment);
       setProject({ ...project, deployment: nextDeployment });
       await loadProjects();
+      if (project.id) loadVersions(project.id);
       if (payload.foundry?.errors) {
         setDeploymentUiState("failed");
         setDeploymentMessage("Foundry deployment returned errors.");
@@ -714,9 +765,6 @@ export default function App() {
                 <div>
                   <h3>{savedProject.name}</h3>
                   <p>{savedProject.description || "No description"}</p>
-                  {assignedRoles.length ? <div className="project-role-list">
-                    {assignedRoles.map((assignedRole) => <span className="member-tile role" key={assignedRole.id ?? assignedRole.name}><span className="member-tile-name">{assignedRole.name}</span></span>)}
-                  </div> : null}
                 </div>
                 <div className="project-actions">
                   <button disabled={isOpeningProject} onClick={() => openProject(savedProject)}>
@@ -740,25 +788,6 @@ export default function App() {
             <div className="grid two">
               <label>Project name<input value={project.name} onChange={(e) => setProject({ ...project, name: e.target.value })} /></label>
               <label>Deployment mode<select value={project.deployment_mode} onChange={(e) => setProject({ ...project, deployment_mode: e.target.value as any })}><option value="orchestrator">Orchestrator with subagents</option><option value="orchestrator_only">Orchestrator Only</option><option value="standalone">Standalone agent</option></select></label>
-            </div>
-            <div className="grid two">
-              <label className="role-add-picker">Add role{!project.id ? <span className="hint"> (save project first)</span> : null}
-                <select disabled={!project.id || !assignableRoles.length} value="" onChange={(e) => { addProjectRoleAssignment(e.target.value); e.currentTarget.value = ""; }}>
-                  <option value="">Choose a role...</option>
-                  {assignableRoles.filter((role) => role.id && !(projectRoleBinding?.role_ids ?? []).includes(role.id) && !isAdminRoleName(role.name) && !isAgentCreatorRoleName(role.name)).map((role) => <option key={role.id} value={role.id!}>{role.name}</option>)}
-                </select>
-              </label>
-              <label>Agent roles
-                <div className="role-detail-list">
-                  {(projectRoleBinding?.role_ids ?? []).length ? (projectRoleBinding?.role_ids ?? []).map((roleId) => {
-                    const assignedRole = roles.find((role) => role.id === roleId);
-                    return <span className="member-tile role" key={roleId}>
-                      <span className="member-tile-name">{assignedRole?.name || roleId}</span>
-                      <button className="member-tile-remove" onClick={() => removeProjectRoleAssignment(roleId)}>&times;</button>
-                    </span>;
-                  }) : <span className="role-member-empty">None</span>}
-                </div>
-              </label>
             </div>
             <label>Description<textarea value={project.description} onChange={(e) => setProject({ ...project, description: e.target.value })} /></label>
           </section>
@@ -836,12 +865,43 @@ export default function App() {
 
           <section className="panel" id="deploy">
             <h2>Deploy to Foundry Hosted Agents</h2>
+            {viewingVersionSnapshot ? (
+              <div className="deployment-state completed" role="status" style={{ marginBottom: 12 }}>
+                <AlertTriangle size={18} />
+                <div>
+                  <strong>Viewing version {selectedVersion} (read-only snapshot)</strong>
+                  <span>Edits are disabled. Switch to "Current Draft" to make changes.</span>
+                </div>
+              </div>
+            ) : null}
             <div className="action-row">
-              <button disabled={isDeploying} onClick={deployToFoundry}>
+              <button disabled={isDeploying || viewingVersionSnapshot} onClick={deployToFoundry}>
                 {isDeploying ? <Loader2 className="spin" size={16} /> : <ExternalLink size={16} />}
                 {isDeploying ? "Deploying..." : "Deploy to Foundry"}
               </button>
             </div>
+            {/* Version selector */}
+            {projectVersions.length > 0 ? (
+              <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+                <strong>Version:</strong>
+                <select
+                  value={selectedVersion || ""}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (!v) { switchToLive(); }
+                    else { switchToVersion(v); }
+                  }}
+                  style={{ fontSize: 13, padding: "4px 8px" }}
+                >
+                  <option value="">Current Draft</option>
+                  {projectVersions.map((v) => (
+                    <option key={v.version} value={v.version}>
+                      v{String(v.version).replace(/^v/i, "")} — {v.deployed_at ? new Date(v.deployed_at).toLocaleString() : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : null}
             {deploymentUiState !== "idle" ? (
               <div className={`deployment-state ${deploymentUiState}`} role="status" aria-live="polite">
                 {deploymentUiState === "working" ? <Loader2 className="spin" size={18} /> : deploymentUiState === "completed" ? <CheckCircle2 size={18} /> : <AlertTriangle size={18} />}
@@ -852,21 +912,27 @@ export default function App() {
                 </div>
               </div>
             ) : null}
-            {(deployment?.info || project.deployment?.info) ? (() => {
+            {(deployment?.info || project.deployment?.info || project.deployment) ? (() => {
               const info = deployment?.info || (project.deployment as any)?.info;
+              const dep = deployment || project.deployment as any;
+              const agentName = info?.agent_name || dep?.agent_name || "—";
+              const version = info?.version || dep?.foundry?.version || dep?.version || "—";
+              const agentEndpoint = info?.agent_endpoint || dep?.agent_endpoint || dep?.foundry_agent_link || "—";
+              const deployedAt = info?.deployed_at || dep?.deployed_at || dep?.foundry?.created_at;
+              const foundryLink = info?.foundry_agent_link || dep?.foundry_agent_link || dep?.foundry?.foundry_agent_link;
               return (
                 <div className="deployment-info-card" style={{ border: "1px solid var(--border)", borderRadius: 8, padding: 16, marginTop: 12 }}>
-                  <h3 style={{ margin: "0 0 12px 0", fontSize: 14 }}>Deployed Agent Info</h3>
+                  <h3 style={{ margin: "0 0 12px 0", fontSize: 14 }}>Current Deployed Agent Info</h3>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px 24px", fontSize: 13 }}>
-                    <div><strong>Agent Name</strong><br />{info.agent_name || "—"}</div>
-                    <div><strong>Version</strong><br />{info.version || "—"}</div>
-                    <div style={{ gridColumn: "1 / -1" }}><strong>Agent Endpoint</strong><br /><code style={{ fontSize: 12, wordBreak: "break-all" }}>{info.agent_endpoint || "—"}</code></div>
-                    <div><strong>Deployed At</strong><br />{info.deployed_at ? new Date(info.deployed_at).toLocaleString() : "—"}</div>
+                    <div><strong>Agent Name</strong><br />{agentName}</div>
+                    <div><strong>Version</strong><br />{version}</div>
+                    <div style={{ gridColumn: "1 / -1" }}><strong>Agent Endpoint</strong><br /><code style={{ fontSize: 12, wordBreak: "break-all" }}>{agentEndpoint}</code></div>
+                    <div><strong>Deployed At</strong><br />{deployedAt ? new Date(deployedAt).toLocaleString() : "—"}</div>
                   </div>
-                  {info.foundry_agent_link ? <a href={info.foundry_agent_link} target="_blank" rel="noreferrer" style={{ display: "inline-block", marginTop: 8, fontSize: 13 }}>Open in Foundry Portal →</a> : null}
+                  {foundryLink ? <a href={foundryLink} target="_blank" rel="noreferrer" style={{ display: "inline-block", marginTop: 8, fontSize: 13 }}>Open in Foundry Portal →</a> : null}
                 </div>
               );
-            })() : deployment ? <pre style={{ marginTop: 12 }}>{JSON.stringify(deployment, null, 2)}</pre> : null}
+            })() : null}
           </section>
         </> : activeTab === "roles" ? <section className="panel" id="roles">
           <div className="section-header"><h2>Roles &amp; Permissions</h2><button onClick={() => setEditingRole(newRole())}><Plus size={16} /> New Role</button></div>
@@ -897,6 +963,30 @@ export default function App() {
               }}
               clearOnSelect
             />
+            {editingRole.id && !isAdminRoleName(editingRole.name) && !isDeveloperRoleName(editingRole.name) ? (() => {
+              const roleAgents = agentBindings.filter((binding) => binding.role_ids.includes(editingRole.id!));
+              const unassignedAgents = agentBindings.filter((binding) => !binding.role_ids.includes(editingRole.id!));
+              return (<>
+                <h4 style={{ marginTop: 12 }}>Assigned Agents</h4>
+                <div className="member-tiles assignment-tags">
+                  {roleAgents.length ? roleAgents.map((binding) => (
+                    <span key={binding.project_id} className="member-tile role">
+                      <span className="member-tile-name">{binding.agent_name || binding.project_display_name}</span>
+                      <button className="member-tile-remove" onClick={() => saveAgentBinding({ ...binding, role_ids: binding.role_ids.filter((rid) => rid !== editingRole.id) })}>&times;</button>
+                    </span>
+                  )) : <span className="model-pill empty" style={{ fontSize: 12 }}>No agents assigned</span>}
+                </div>
+                {unassignedAgents.length ? (
+                  <select style={{ marginTop: 6, fontSize: 12, padding: "3px 6px" }} value="" onChange={(e) => {
+                    const binding = agentBindings.find((b) => b.project_id === e.target.value);
+                    if (binding) saveAgentBinding({ ...binding, role_ids: [...binding.role_ids, editingRole.id!] });
+                  }}>
+                    <option value="">Add agent...</option>
+                    {unassignedAgents.map((binding) => <option key={binding.project_id} value={binding.project_id}>{binding.agent_name || binding.project_display_name}</option>)}
+                  </select>
+                ) : null}
+              </>);
+            })() : null}
             <div className="action-row" style={{ marginTop: 12 }}>
               <button onClick={() => saveRole(editingRole)}><Save size={16} /> Save Role</button>
               <button onClick={() => setEditingRole(null)}>Cancel</button>
@@ -909,7 +999,7 @@ export default function App() {
                 <div>
                   <h3>{role.name}</h3>
                   <p>{role.description || "No description"}</p>
-                  <p style={{ fontSize: 12, opacity: 0.7 }}>{role.members.length} member{role.members.length === 1 ? "" : "s"}</p>
+                  <p style={{ fontSize: 12, opacity: 0.7 }}>{role.members.length} member{role.members.length === 1 ? "" : "s"}{!isAdminRoleName(role.name) && !isDeveloperRoleName(role.name) ? ` · ${agentBindings.filter((b) => b.role_ids.includes(role.id!)).length} agent${agentBindings.filter((b) => b.role_ids.includes(role.id!)).length === 1 ? "" : "s"}` : ""}</p>
                 </div>
                 <div className="project-actions">
                   <button onClick={() => setEditingRole({ ...role })}><FolderOpen size={16} /> Edit</button>
@@ -917,26 +1007,6 @@ export default function App() {
                 </div>
               </div>
             )) : <div className="empty-state"><p>No roles defined yet.</p><button onClick={() => setEditingRole(newRole())}><Plus size={16} /> Create your first role</button></div>}
-          </div>
-
-          <div style={{ marginTop: 24 }}>
-            <div className="section-header"><h2>Agent Role Assignments</h2></div>
-            {agentBindings.length ? agentBindings.map((binding) => (
-              <div className="project-card" key={binding.id ?? binding.project_id} style={{ marginBottom: 12 }}>
-                <div>
-                  <h3>{binding.agent_name || binding.project_display_name}</h3>
-                </div>
-                <div className="member-tiles assignment-tags">
-                  {binding.role_ids.length ? binding.role_ids.map((roleId) => {
-                    const assignedRole = roles.find((role) => role.id === roleId);
-                    return <span key={roleId} className="member-tile role">
-                      <span className="member-tile-name">{assignedRole?.name || roleId}</span>
-                      <button className="member-tile-remove" onClick={() => saveAgentBinding({ ...binding, role_ids: binding.role_ids.filter((currentRoleId) => currentRoleId !== roleId) })}>&times;</button>
-                    </span>;
-                  }) : <span className="model-pill empty">No roles</span>}
-                </div>
-              </div>
-            )) : <div className="empty-state"><p>No agent role assignments yet. Deploy an agent to create bindings.</p></div>}
           </div>
         </section> : <section className="dev-layout" id="dev">
           <div className="panel dev-console">

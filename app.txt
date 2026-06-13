@@ -8,7 +8,6 @@ responses protocol so it can be registered as a hosted agent.
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 import base64
@@ -16,10 +15,16 @@ import asyncio
 import time
 import uuid
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any
 from urllib.parse import urljoin
 
-import aiohttp
+import aiohttp    _invoke_external_agent (calling sub-agents)	_run_agent_sse (returning to user/Foundry)
+app.txt	Streaming ("stream": True, SSE parsing)	NOT truly streaming — runs agent to completion, emits one response.output_text.done event
+app.py (current)	Non-streaming ("stream": False, JSON response)	True token streaming — emits response.output_text.delta per chunk via run_stream
+So app.txt streams inbound from sub-agents (to avoid their timeout) but sends one big outbound response. Current app.py does the opposite — simple JSON inbound from sub-agents but true token-by-token outbound streaming to the caller.
+
+The "stream cuts off" problem you reported relates to the outbound side — app.py's run_stream goes silent during tool execution. app.txt's approach avoids that by not streaming outbound at all (just one final event after everything completes).
 import uvicorn
 from azure.cosmos import CosmosClient
 from azure.identity import ClientSecretCredential, DefaultAzureCredential
@@ -59,6 +64,8 @@ try:
 except ImportError:
     from agent_framework import FoundryChatClient
 
+from agent_framework import FunctionInvocationConfiguration
+
 load_dotenv()
 
 # ── Observability / Tracing ───────────────────────────────────────────────────
@@ -87,18 +94,6 @@ except Exception:
     pass
 
 app = FastAPI(title="Hosted Agent Runtime")
-
-# ── Instrument FastAPI + aiohttp for trace propagation ────────────────────────
-try:
-    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-    FastAPIInstrumentor.instrument_app(app)
-except Exception:
-    pass
-try:
-    from opentelemetry.instrumentation.aiohttp_client import AioHttpClientInstrumentor
-    AioHttpClientInstrumentor().instrument()
-except Exception:
-    pass
 
 FABRIC_API = "https://api.fabric.microsoft.com/v1"
 FABRIC_API_ROOT = "https://api.fabric.microsoft.com"
@@ -152,22 +147,22 @@ def _get_chat_client(model_config: dict[str, Any] | None = None) -> Any:
     project_endpoint = (os.environ.get("MAF_FOUNDRY_PROJECT_ENDPOINT") or os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")).rstrip("/")
     deployment_name = _resolve_model_deployment(model_config)
 
+    max_iters = int(os.environ.get("AGENT_MAX_ITERATIONS", "80"))
+    max_calls = int(os.environ.get("AGENT_MAX_FUNCTION_CALLS", "200"))
+    fic = FunctionInvocationConfiguration()
+    fic["max_iterations"] = max_iters
+    fic["max_function_calls"] = max_calls
+
     return FoundryChatClient(
         project_endpoint=project_endpoint or None,
         model=deployment_name or None,
         credential=_credential(),
+        function_invocation_configuration=fic,
     )
 
 
-_project_cache: dict[str, Any] | None = None
-
-
+@lru_cache(maxsize=1)
 def _project() -> dict[str, Any]:
-    global _project_cache
-    if _project_cache is not None:
-        return _project_cache
-
-    logger = logging.getLogger(__name__)
     project_id = (os.environ.get("MAF_MGMT_PROJECT_ID") or os.environ.get("AGENT_MGMT_PROJECT_ID", "")).strip()
     if not project_id:
         raise RuntimeError("MAF_MGMT_PROJECT_ID is required.")
@@ -175,29 +170,9 @@ def _project() -> dict[str, Any]:
     if not endpoint:
         raise RuntimeError("MAF_MGMT_COSMOS_ENDPOINT is required.")
     database_name = os.environ.get("MAF_MGMT_COSMOS_DATABASE") or os.environ.get("AGENT_MGMT_COSMOS_DATABASE", "agents")
-    versions_container = os.environ.get("MAF_MGMT_VERSIONS_CONTAINER") or os.environ.get("AGENT_MGMT_VERSIONS_CONTAINER", "agentversions")
-    client = CosmosClient(endpoint, credential=_credential())
-    db = client.get_database_client(database_name)
-
-    # Load the latest version snapshot from agentversions
-    try:
-        container = db.get_container_client(versions_container)
-        query = "SELECT TOP 1 * FROM c WHERE c.projectid = @pid ORDER BY c.deployed_at DESC"
-        params = [{"name": "@pid", "value": project_id}]
-        results = list(container.query_items(query=query, parameters=params, partition_key=project_id, max_item_count=1))
-        if results and results[0].get("snapshot"):
-            logger.info("_project: loaded snapshot version %s from %s", results[0].get("version"), versions_container)
-            _project_cache = results[0]["snapshot"]
-            return _project_cache
-        else:
-            logger.warning("_project: no version snapshots found in %s for project %s", versions_container, project_id)
-    except Exception as exc:
-        logger.warning("_project: failed to query agentversions: %s", exc)
-
-    # Fallback: live read from agentmetadata (local dev / pre-versioning deployments)
     container_name = os.environ.get("MAF_MGMT_COSMOS_CONTAINER") or os.environ.get("AGENT_MGMT_COSMOS_CONTAINER", "agentmetadata")
-    logger.warning("_project: falling back to live read from %s", container_name)
-    container = db.get_container_client(container_name)
+    client = CosmosClient(endpoint, credential=_credential())
+    container = client.get_database_client(database_name).get_container_client(container_name)
     return container.read_item(item=project_id, partition_key=project_id)
 
 
@@ -491,6 +466,7 @@ async def _invoke_external_agent(agent_name: str, message: str, fabric_token: st
                         payload = {"raw": text}
 
                     if isinstance(payload, dict):
+                        # Check output_text field first
                         if isinstance(payload.get("output_text"), str) and payload["output_text"]:
                             return {"agent_name": agent_name, "response": payload["output_text"]}
                         output = payload.get("output")
@@ -937,9 +913,9 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
             tables = await _semantic_model_tables_from_dax(session, dataset_url, effective_powerbi_token)
             if not tables.get("errors") and tables.get("value"):
                 return json.dumps({"workspace_id": workspace_id, "semantic_model_id": semantic_model_id, "tables": tables}, indent=2)
-
+            
             dax_errors = tables.get("errors", [])
-
+            
             # Fallback: getDefinition (optional, may require higher item permissions)
             definition_result: dict[str, Any] = {}
             definition_errors: list[dict[str, Any]] = []
@@ -954,14 +930,14 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
                     return json.dumps(result, indent=2)
                 definition_errors = definition_result.get("errors", [])
             except Exception as e:
-                logging.getLogger("hosted_agent_runtime").debug(f"getDefinition failed (optional): {e}")
+                logger.debug(f"getDefinition failed (optional): {e}")
                 definition_errors = [{"message": str(e)}]
-
+            
             # Last resort: REST /tables endpoint
             tables = await _get_json(session, f"{dataset_url}/tables", _powerbi_headers(effective_powerbi_token))
             if tables.get("value"):
                 return json.dumps({"workspace_id": workspace_id, "semantic_model_id": semantic_model_id, "tables": tables}, indent=2)
-
+            
             # All methods failed; return diagnostics
             diagnostics: list[dict[str, Any]] = []
             if dax_errors:
@@ -1102,35 +1078,14 @@ async def _run_agent(project: dict[str, Any], message: str, fabric_token: str, c
 
     thread = _get_or_create_thread(conversation_id)
     try:
-        if not hasattr(agent, "run_stream"):
-            if thread is not None:
-                response = await agent.run(message, session=thread)
-            else:
-                response = await agent.run(message)
-            result = _agent_response_text(response)
-            logger.info("Agent response length: %d chars", len(result))
-            if not result.strip():
-                logger.warning("Agent returned empty response. Raw response object: %s", repr(response)[:500])
-            return result
-        chunks: list[str] = []
-        if hasattr(agent, "run_stream"):
-            if thread is not None:
-                stream = agent.run_stream(message, thread=thread)
-            else:
-                stream = agent.run_stream(message)
-        elif thread is not None:
-            stream = agent.run(message, stream=True, session=thread)
+        if thread is not None:
+            response = await agent.run(message, session=thread)
         else:
-            stream = agent.run(message, stream=True)
-        async for update in stream:
-            contents = getattr(update, "contents", None) or []
-            for content in contents:
-                if TextContent is not None and isinstance(content, TextContent) and content.text:
-                    chunks.append(content.text)
-                elif hasattr(content, "text") and content.text:
-                    chunks.append(content.text)
-        result = "".join(chunks)
-        logger.info("Agent stream response length: %d chars", len(result))
+            response = await agent.run(message)
+        result = _agent_response_text(response)
+        logger.info("Agent response length: %d chars", len(result))
+        if not result.strip():
+            logger.warning("Agent returned empty response. Raw response object: %s", repr(response)[:500])
         return result
     except Exception as exc:
         logger.exception("Agent run failed")
@@ -1231,33 +1186,11 @@ async def _run_agent_sse(project: dict[str, Any], message: str, fabric_token: st
             yield event
         return
 
-    thread = _get_or_create_thread(conversation_id)
-    full_response: list[str] = []
-
     try:
-        if hasattr(agent, "run_stream"):
-            if thread is not None:
-                stream = agent.run_stream(message, thread=thread)
-            else:
-                stream = agent.run_stream(message)
-        elif thread is not None:
-            stream = agent.run(message, stream=True, session=thread)
-        else:
-            stream = agent.run(message, stream=True)
-
-        async for update in stream:
-            contents = getattr(update, "contents", None) or []
-            for content in contents:
-                text = ""
-                if TextContent is not None and isinstance(content, TextContent) and content.text:
-                    text = content.text
-                elif hasattr(content, "text") and content.text:
-                    text = content.text
-                if text:
-                    full_response.append(text)
-                    yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'delta': text})}\n\n"
-
-        logger.info("Agent streamed response length: %d chars", len("".join(full_response)))
+        result = await _run_agent(project, message, fabric_token, conversation_id, powerbi_token)
+        logger.info("Agent streamed final response length: %d chars", len(result))
+        if result:
+            yield f"event: response.output_text.done\ndata: {json.dumps({'type': 'response.output_text.done', 'text': result})}\n\n"
         yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': {'id': response_id, 'status': 'completed'}})}\n\n"
         yield "data: [DONE]\n\n"
     except Exception as exc:

@@ -20,7 +20,7 @@ from .foundry_management import create_hosted_agent_version, foundry_agent_link,
 from .hosted_agent_builder import build_hosted_agent_deployment, validate_project
 from .models import AgentRoleBinding, DeploymentRequest, DevChatRequest, PromptGenerationRequest, AgentProject, Role
 from .permissions_store import create_permissions_store
-from .project_store import create_project_store
+from .project_store import create_project_store, get_version_store
 from .prompt_generator import dev_chat, generate_prompt
 
 ROOT = Path(__file__).resolve().parent
@@ -450,6 +450,8 @@ async def deploy_submit_foundry(request: DeploymentRequest):
         else:
             _model_deployment = (project_dict.get("orchestrator") or {}).get("model_config", {}).get("deployment_name", "")
         env_vars: dict[str, str] = {"MAF_MGMT_PROJECT_ID": saved_project.id}
+        env_vars["MAF_MGMT_VERSIONS_CONTAINER"] = os.environ.get("AGENT_MGMT_VERSIONS_CONTAINER", "agentversions")
+        env_vars["MAF_MGMT_AGENT_NAME"] = build["agent_name"]
         if _model_deployment:
             env_vars["model_deployment_name"] = _model_deployment
             env_vars["AZURE_OPENAI_DEPLOYMENT_NAME"] = _model_deployment
@@ -458,6 +460,7 @@ async def deploy_submit_foundry(request: DeploymentRequest):
             env_vars["AZURE_OPENAI_DEPLOYMENT_NAME"] = os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"]
         # Add a deployment nonce so Foundry always creates a new version
         env_vars["project_deployed_at"] = datetime.now(timezone.utc).isoformat()
+
         result = await create_hosted_agent_version(
             agent_name=build["agent_name"],
             image=build["image"],
@@ -485,6 +488,19 @@ async def deploy_submit_foundry(request: DeploymentRequest):
             or result.get("version_id")
             or agent_info.get("version")
         )
+
+        # --- Save immutable version snapshot to Cosmos using Foundry version number ---
+        if foundry_version:
+            try:
+                get_version_store().save_version(
+                    project_id=saved_project.id,
+                    version=str(foundry_version),
+                    snapshot=project_dict,
+                )
+            except Exception as ver_exc:
+                import logging
+                logging.getLogger(__name__).warning("Failed to save version snapshot: %s", ver_exc)
+
         # Normalize timestamp: Foundry may return Unix seconds, ISO string, or nothing
         def _normalize_timestamp(val):
             if val is None:
@@ -539,6 +555,28 @@ async def deploy_submit_foundry(request: DeploymentRequest):
         import traceback
         traceback.print_exc()
         return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Project Versions API
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/projects/{project_id}/versions")
+async def list_project_versions(project_id: str):
+    try:
+        versions = get_version_store().list_versions(project_id)
+        return {"versions": versions}
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/projects/{project_id}/versions/{version}")
+async def get_project_version(project_id: str, version: str):
+    doc = get_version_store().get_version(project_id, version)
+    if not doc:
+        return JSONResponse({"error": "Version not found"}, status_code=404)
+    return doc
 
 
 # ---------------------------------------------------------------------------

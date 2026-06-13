@@ -95,6 +95,7 @@ def _ensure_bootstrap_admin_role(
     save_role,
 ) -> list[dict[str, Any]]:
     roles = _ensure_configured_admin_role(roles, save_role)
+    roles = _ensure_developer_role(roles, save_role)
     match = _bootstrap_admin_match(user_object_id, group_ids)
     if match is None:
         return roles
@@ -142,6 +143,18 @@ def _ensure_configured_admin_role(roles: list[dict[str, Any]], save_role) -> lis
     updated_roles = [*roles]
     updated_roles[admin_role_index] = saved.model_dump(mode="json")
     return updated_roles
+
+
+def _is_developer_role(role: dict[str, Any]) -> bool:
+    return role.get("name", "").strip().lower() == "developer"
+
+
+def _ensure_developer_role(roles: list[dict[str, Any]], save_role) -> list[dict[str, Any]]:
+    """Ensure the Developer role exists (created empty if missing)."""
+    if any(_is_developer_role(role) for role in roles):
+        return roles
+    saved = save_role(Role(name="Developer", description="Can create and modify agents but cannot delete them.", members=[]))
+    return [*roles, saved.model_dump(mode="json")]
 
 
 class CosmosPermissionsStore(PermissionsStore):
