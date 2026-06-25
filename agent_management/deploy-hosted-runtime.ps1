@@ -3,7 +3,7 @@ param(
     [string]$AcrLoginServer = "",
     [string]$Subscription = "",
     [string]$ImageName = "hosted-agent-runtime",
-    [string[]]$Tags = @("latest"),
+    [string[]]$Tags = @(),
     [string]$Platform = "linux/amd64",
     [switch]$SkipBuild,
     [switch]$SkipLogin
@@ -48,6 +48,11 @@ if (-not (Test-Path (Join-Path $runtimeRoot "Dockerfile"))) {
     throw "Hosted runtime Dockerfile was not found at $runtimeRoot."
 }
 
+if (-not $Tags -or $Tags.Count -eq 0) {
+    $timestampTag = "dt-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    $Tags = @("latest", $timestampTag)
+}
+
 $docker = Get-Command docker -ErrorAction SilentlyContinue
 if (-not $docker) {
     throw "Docker is required to build and push the hosted runtime image."
@@ -71,7 +76,7 @@ if (-not $SkipLogin) {
 }
 
 $fullTags = $Tags | ForEach-Object { "$AcrLoginServer/$ImageName`:$_" }
-$primaryTag = $fullTags[0]
+$primaryTag = if ($fullTags.Count -gt 1) { $fullTags[1] } else { $fullTags[0] }
 
 if (-not $SkipBuild) {
     Push-Location $runtimeRoot

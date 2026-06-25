@@ -1166,6 +1166,7 @@ export default function App() {
                 {isDeploying ? <Loader2 className="spin" size={16} /> : <ExternalLink size={16} />}
                 {isDeploying ? "Deploying..." : "Deploy to Foundry"}
               </button>
+              <button disabled={isDeploying} onClick={loadRuntimeVersions}><RefreshCw size={16} /> Refresh runtime versions</button>
             </div>
             <div className="grid two" style={{ marginTop: 12 }}>
               <label>Project Version

@@ -87,6 +87,9 @@ try:
         import logging as _logging
         from opentelemetry._logs import get_logger_provider
         from opentelemetry.sdk._logs import LoggingHandler
+        _logging.getLogger().setLevel(_logging.INFO)
+        _logging.getLogger("hosted_agent_runtime").setLevel(_logging.INFO)
+        _logging.getLogger("hosted_agent_runtime.traces").setLevel(_logging.INFO)
         _otel_handler = LoggingHandler(logger_provider=get_logger_provider())
         _logging.getLogger().addHandler(_otel_handler)
 except Exception:
