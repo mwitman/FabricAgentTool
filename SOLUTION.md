@@ -34,7 +34,7 @@ The agent management app is the authoring and deployment surface. It lets an aut
 
 Key responsibilities:
 
-- Discover Fabric data sources the user can access.
+- Discover Fabric data sources across all Fabric workspaces the signed-in user can access.
 - Create standalone agents or orchestrator agents.
 - Generate system prompts with a Foundry model.
 - Store project metadata in Azure Cosmos DB.
@@ -109,6 +109,8 @@ It is used for:
 - Foundry-hosted LLM calls through `FoundryChatClient`.
 - Agent-to-agent Foundry calls from orchestrator-only agents.
 - Mem0 calls to Foundry-backed embedding and chat deployments.
+- Semantic metadata refresh through Fabric `getDefinition`.
+- Azure Container Registry runtime-version reads from Agent Management.
 
 The hosted runtime uses `ClientSecretCredential` when those values are present and falls back to `DefaultAzureCredential` otherwise.
 
@@ -117,10 +119,12 @@ The hosted runtime uses `ClientSecretCredential` when those values are present a
 The signed-in user's delegated tokens are used for data access:
 
 - Microsoft Graph token: identifies the user and group membership for role filtering.
-- Fabric token: authorizes Fabric API, GraphQL, SQL endpoint, Fabric Data Agent, and Fabric MCP calls.
+- Fabric token: discovers Fabric data sources for the Agent Management dropdown and authorizes Fabric API, GraphQL, SQL endpoint, Fabric Data Agent, and Fabric MCP calls.
 - Power BI token: authorizes semantic model metadata and DAX query calls where needed.
 
 The Foundry playground does not supply the user's Fabric token. Fabric-backed agents therefore require the custom UX or another client that forwards the user's Fabric token.
+
+Fabric data-source discovery in Agent Management uses the signed-in user's delegated Fabric token. The backend enumerates all workspaces visible to that user, then lists supported items in each workspace. It does not use the service principal for the data-source dropdown.
 
 ## Cosmos DB Data Model
 

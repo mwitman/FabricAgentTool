@@ -4,12 +4,14 @@ A management UX for creating Fabric semantic model agents and deploying them as 
 
 ## What It Does
 
-- Lists Fabric semantic models the signed-in user can access.
+- Lists Fabric data sources the signed-in user can access across all visible Fabric workspaces.
 - Creates either a standalone semantic model agent or an orchestrator with semantic-model subagents.
 - Uses a Foundry model to generate orchestrator, subagent, and standalone prompts.
 - Provides a built-in Dev UI to test agent behavior before deployment.
 - Deploys projects to Foundry Hosted Agents using a reusable hosted-agent runtime image.
 - Stores agent projects in Azure Cosmos DB.
+
+Supported data-source types include semantic models, GraphQL APIs, SQL endpoints/warehouses, Fabric Data Agents, and Fabric MCP sources. Semantic models have first-class cached metadata support. SQL endpoint query execution is supported through Fabric MCP, but SQL endpoint schema enumeration is not yet cached or enforced as a first-class metadata flow.
 
 ## Azure Cosmos DB
 
@@ -53,16 +55,223 @@ docker push <your-acr>.azurecr.io/agent-management:latest
 
 Deploys Foundry Hosted Agents by saving the project to Azure Cosmos DB and submitting a reusable runtime image with `AGENT_MGMT_PROJECT_ID`. Users do not need to generate a local package for each project.
 
-Build and push the runtime image with both `latest` and a concrete version tag:
+Build and push the runtime image with both `latest` and a concrete datetime version tag:
 
 ```powershell
 cd agent_management
-.\deploy-hosted-runtime.ps1 -Tags latest,v8
+.\deploy-hosted-runtime.ps1
 ```
 
-The script only pushes image tags. When an agent is redeployed from Agent Management, the backend resolves `hosted-agent-runtime:latest` in ACR, finds the matching concrete version tag, and deploys the hosted agent with that pinned tag. A later push to `latest` will not affect existing agents until they are redeployed.
+By default the script pushes:
+
+```text
+latest
+dt-yyyyMMdd-HHmmss
+```
+
+The script only pushes image tags. When an agent is redeployed from Agent Management, the backend resolves `hosted-agent-runtime:latest` in ACR, finds the matching concrete version tag, and deploys the hosted agent with that pinned tag. A later push to `latest` will not affect existing agents until they are redeployed. Use the runtime-version refresh button in Agent Management after pushing a new runtime image.
+
+The Agent Management backend service principal needs `AcrPull` on the registry or the `hosted-agent-runtime` repository to list available runtime versions. The identity running `deploy-hosted-runtime.ps1` needs `AcrPush`.
 
 At deployment time, the project ID and Cosmos settings are passed to Foundry so the hosted agent loads its project definition directly from Azure Cosmos DB.
+
+## Authorization Flow
+
+Agent Management intentionally uses two authorization contexts.
+
+The signed-in user's delegated Fabric token is used for the data-source dropdown. The frontend acquires a Fabric token with MSAL, sends it to `/api/fabric/items`, and the backend calls Fabric `/workspaces` followed by `/workspaces/{workspace_id}/items`. The dropdown therefore shows supported items from all workspaces visible to that user.
+
+The service principal is used for backend operations: Cosmos DB stores, Foundry management, runtime-version reads from ACR, and semantic metadata refresh with Fabric `getDefinition`. The service principal must be allowed to use Fabric APIs by tenant settings and must also have access to the workspaces/items being refreshed.
+
+## Semantic Metadata Refresh
+
+Semantic model metadata is cached in Cosmos DB using the `AGENT_MGMT_METADATA_CONTAINER` container, defaulting to `semanticmodelmetadata`. Refresh runs and schedules use `AGENT_MGMT_METADATA_SCHEDULE_CONTAINER`, defaulting to `metadatarefresh`.
+
+The Metadata menu's **Run now** button calls `/api/admin/metadata-refresh/run-now`. It scans all saved projects, extracts configured semantic model sources, deduplicates them by `workspace_id:semantic_model_id`, and refreshes each model by calling Fabric `getDefinition?format=TMDL` with the service principal. The refresh writes normalized tables, columns, measures, relationships, and AI instructions to the shared metadata cache.
+
+Deploying to Foundry also refreshes semantic metadata for the project being deployed before the hosted-agent version is submitted. The metadata is written to the shared cache, not embedded into the project version snapshot. Existing deployed agents can see later cache refreshes because the hosted runtime reads from the shared metadata cache container.
+
+## SQL Endpoint Behavior
+
+SQL endpoints and warehouses can be selected as Fabric data sources. At runtime, `execute_fabric_sql_query` validates that the SQL endpoint is configured for the project, blocks non-read-only SQL, and calls Fabric MCP's configured SQL execution tool, defaulting to `execute_sql_query`.
+
+The runtime also exposes generic `call_fabric_mcp` and `call_fabric_mcp_tool` tools, so the model can discover MCP tools and call schema-related MCP tools if they are available. However, the runtime does not currently force a schema-enumeration step before SQL execution, and SQL endpoint schemas are not cached like semantic model metadata.
+
+## Application Insights KQL
+
+Set `APPLICATIONINSIGHTS_CONNECTION_STRING` or `FABRIC_AGENT_APPINSIGHTS_CONNECTION_STRING` so hosted runtime logs and OpenTelemetry spans are exported to Application Insights. Foundry hosted agents reject `APPLICATIONINSIGHTS_CONNECTION_STRING` as a reserved variable, so Agent Management maps it to `FABRIC_AGENT_APPINSIGHTS_CONNECTION_STRING` for the hosted runtime.
+
+After changing hosted runtime telemetry code, rebuild and push the runtime image, then redeploy the hosted agent to the new concrete runtime tag. Existing hosted agents stay pinned to their previously deployed runtime version.
+
+### DAX Tool Call Logs
+
+Workspace-based Application Insights:
+
+```kusto
+AppTraces
+| where TimeGenerated > ago(24h)
+| where Message has "DAX tool call"
+| extend event = extract(@"DAX tool call ([^:]+):", 1, Message)
+| extend workspace_id = extract(@"workspace_id=""([^""]+)""", 1, Message)
+| extend semantic_model_id = extract(@"semantic_model_id=""([^""]+)""", 1, Message)
+| extend query_preview = extract(@"query_preview=""(.*?)""(?: endpoint=| query_count=| execution_mode=|$)", 1, Message)
+| extend endpoint = extract(@"endpoint=""([^""]+)""", 1, Message)
+| extend status = extract(@"status=""([^""]+)""", 1, Message)
+| extend query_count = toint(extract(@"query_count=([0-9]+)", 1, Message))
+| extend row_count = toint(extract(@"row_count=([0-9]+)", 1, Message))
+| extend elapsed_ms = toint(extract(@"elapsed_ms=([0-9]+)", 1, Message))
+| project TimeGenerated, event, status, endpoint, elapsed_ms, workspace_id, semantic_model_id, query_count, row_count, query_preview, Message
+| order by TimeGenerated desc
+```
+
+Classic Application Insights:
+
+```kusto
+traces
+| where timestamp > ago(24h)
+| where message has "DAX tool call"
+| extend event = extract(@"DAX tool call ([^:]+):", 1, message)
+| extend workspace_id = extract(@"workspace_id=""([^""]+)""", 1, message)
+| extend semantic_model_id = extract(@"semantic_model_id=""([^""]+)""", 1, message)
+| extend query_preview = extract(@"query_preview=""(.*?)""(?: endpoint=| query_count=| execution_mode=|$)", 1, message)
+| extend endpoint = extract(@"endpoint=""([^""]+)""", 1, message)
+| extend status = extract(@"status=""([^""]+)""", 1, message)
+| extend query_count = toint(extract(@"query_count=([0-9]+)", 1, message))
+| extend row_count = toint(extract(@"row_count=([0-9]+)", 1, message))
+| extend elapsed_ms = toint(extract(@"elapsed_ms=([0-9]+)", 1, message))
+| project timestamp, event, status, endpoint, elapsed_ms, workspace_id, semantic_model_id, query_count, row_count, query_preview, message
+| order by timestamp desc
+```
+
+### Generic Tool Call Logs
+
+Workspace-based Application Insights:
+
+```kusto
+AppTraces
+| where TimeGenerated > ago(24h)
+| where Message has "LLM tool call"
+| extend event = extract(@"LLM tool call ([^:]+):", 1, Message)
+| extend conversation_id = extract(@"conversation_id=([^ ]+)", 1, Message)
+| extend tool = extract(@"tool=([^ ]+)", 1, Message)
+| extend status = extract(@"status=([^ ]+)", 1, Message)
+| extend elapsed_ms = toint(extract(@"elapsed_ms=([0-9]+)", 1, Message))
+| project TimeGenerated, event, conversation_id, tool, status, elapsed_ms, Message
+| order by TimeGenerated desc
+```
+
+Classic Application Insights:
+
+```kusto
+traces
+| where timestamp > ago(24h)
+| where message has "LLM tool call"
+| extend event = extract(@"LLM tool call ([^:]+):", 1, message)
+| extend conversation_id = extract(@"conversation_id=([^ ]+)", 1, message)
+| extend tool = extract(@"tool=([^ ]+)", 1, message)
+| extend status = extract(@"status=([^ ]+)", 1, message)
+| extend elapsed_ms = toint(extract(@"elapsed_ms=([0-9]+)", 1, message))
+| project timestamp, event, conversation_id, tool, status, elapsed_ms, message
+| order by timestamp desc
+```
+
+### DAX Spans
+
+Workspace-based Application Insights:
+
+```kusto
+AppDependencies
+| where TimeGenerated > ago(24h)
+| where Name == "fabric.dax.execute"
+| extend workspace_id = tostring(Properties["fabric.workspace_id"])
+| extend semantic_model_id = tostring(Properties["fabric.semantic_model_id"])
+| extend query_count = toint(Properties["fabric.dax.query_count"])
+| project TimeGenerated, Name, Success, ResultCode, DurationMs, workspace_id, semantic_model_id, query_count, Properties
+| order by TimeGenerated desc
+```
+
+Classic Application Insights:
+
+```kusto
+dependencies
+| where timestamp > ago(24h)
+| where name == "fabric.dax.execute"
+| extend workspace_id = tostring(customDimensions["fabric.workspace_id"])
+| extend semantic_model_id = tostring(customDimensions["fabric.semantic_model_id"])
+| extend query_count = toint(customDimensions["fabric.dax.query_count"])
+| project timestamp, name, success, resultCode, duration, workspace_id, semantic_model_id, query_count, customDimensions
+| order by timestamp desc
+```
+
+### Fabric and Power BI HTTP Calls
+
+Workspace-based Application Insights:
+
+```kusto
+AppDependencies
+| where TimeGenerated > ago(24h)
+| where Target has_any ("api.powerbi.com", "api.fabric.microsoft.com")
+  or Data has_any ("executeQueries", "executeDaxQueries", "getDefinition")
+  or Name has_any ("executeQueries", "executeDaxQueries", "getDefinition")
+| project TimeGenerated, Name, Target, Data, Success, ResultCode, DurationMs
+| order by TimeGenerated desc
+```
+
+Classic Application Insights:
+
+```kusto
+dependencies
+| where timestamp > ago(24h)
+| where target has_any ("api.powerbi.com", "api.fabric.microsoft.com")
+  or data has_any ("executeQueries", "executeDaxQueries", "getDefinition")
+  or name has_any ("executeQueries", "executeDaxQueries", "getDefinition")
+| project timestamp, name, target, data, success, resultCode, duration
+| order by timestamp desc
+```
+
+### Runtime Startup and Exceptions
+
+Workspace-based startup traces:
+
+```kusto
+AppTraces
+| where TimeGenerated > ago(24h)
+| where Message has_any ("App Insights telemetry configured for hosted runtime", "Agent created", "Agent response", "DAX tool call", "LLM tool call")
+| project TimeGenerated, SeverityLevel, Message, Properties
+| order by TimeGenerated desc
+```
+
+Classic startup traces:
+
+```kusto
+traces
+| where timestamp > ago(24h)
+| where message has_any ("App Insights telemetry configured for hosted runtime", "Agent created", "Agent response", "DAX tool call", "LLM tool call")
+| project timestamp, severityLevel, message, customDimensions
+| order by timestamp desc
+```
+
+Workspace-based exceptions:
+
+```kusto
+AppExceptions
+| where TimeGenerated > ago(24h)
+| where OuterMessage has_any ("DAX", "tool", "executeQueries", "executeDaxQueries")
+  or InnermostMessage has_any ("DAX", "tool", "executeQueries", "executeDaxQueries")
+| project TimeGenerated, Type, OuterMessage, InnermostMessage, ProblemId, Properties
+| order by TimeGenerated desc
+```
+
+Classic exceptions:
+
+```kusto
+exceptions
+| where timestamp > ago(24h)
+| where outerMessage has_any ("DAX", "tool", "executeQueries", "executeDaxQueries")
+  or innermostMessage has_any ("DAX", "tool", "executeQueries", "executeDaxQueries")
+| project timestamp, type, outerMessage, innermostMessage, problemId, customDimensions
+| order by timestamp desc
+```
 
 ## Azure Container Apps
 
