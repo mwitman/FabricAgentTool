@@ -281,7 +281,9 @@ def _build_instructions(project: dict[str, Any]) -> str:
             f"You are {agent.get('name', 'a Fabric semantic model agent')}. "
             f"{agent.get('description', '')} "
             f"You answer questions using {model_name}. "
-            "Use the available tools to get metadata and execute read-only DAX queries."
+            "For any question that asks about data, fields, entities, measures, identity resolution, filtering, counts, totals, trends, or records, call get_semantic_model_metadata first and then call execute_dax_query or execute_dax_queries before answering. "
+            "Do not answer with a plan such as 'I'll start by...' or say you are going to get metadata; call the tool instead. "
+            "Answer from tool results, and say what failed if a required tool call fails."
         )
     if mode == "orchestrator_only":
         orch = project.get("orchestrator_only", {})
@@ -317,12 +319,20 @@ def _with_runtime_tool_policy(prompt: str, configured_sources: list[dict[str, An
     if not configured_sources:
         return prompt
     data_agent_sources = [source for source in configured_sources if source.get("source_type") == "data_agent"]
+    semantic_sources = [source for source in configured_sources if source.get("source_type") == "semantic_model"]
     has_fabric_mcp = any(_source_type(source) == "fabric_mcp" for source in configured_sources)
     policy = [
         "Runtime tool-use policy:",
         f"Configured data sources: {_format_data_source_summary(configured_sources)}.",
         "Use the available Fabric tools for configured sources before deciding a request is out of scope.",
     ]
+    if semantic_sources:
+        policy.extend([
+            "For semantic-model questions about data, fields, entities, measures, identity resolution, filtering, counts, totals, trends, records, or DAX, call get_semantic_model_metadata before answering.",
+            "For data-backed answers, call execute_dax_query or execute_dax_queries after metadata is available; do not answer from assumptions or prompt text alone.",
+            "Do not respond with a plan such as 'I'll start by getting metadata'; make the tool call in the same turn instead.",
+            "If a required metadata or DAX tool call fails, report the failure and include the relevant error details from the tool result.",
+        ])
     if has_fabric_mcp:
         policy.extend([
             "For Fabric MCP, use discover_accessible_fabric_items to find accessible semantic models, GraphQL APIs, SQL endpoints, Warehouses, Data Agents, and other supported Fabric items.",
@@ -988,7 +998,7 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
 
     @ai_function(
         name="get_semantic_model_metadata",
-        description="Get table, column, measure, relationship, and AI instruction metadata for a Fabric semantic model. Call this before writing DAX.",
+        description="Required first step for semantic-model questions. Get table, column, measure, relationship, and AI instruction metadata for a Fabric semantic model before answering or writing DAX.",
     )
     async def get_semantic_model_metadata(workspace_id: str, semantic_model_id: str) -> str:
         if not _can_query_semantic_model(workspace_id, semantic_model_id):
@@ -1041,7 +1051,7 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
     @ai_function(
         name="execute_dax_query",
         description=(
-            "Execute a guarded read-only DAX query against a Fabric semantic model. "
+            "Execute a guarded read-only DAX query against a Fabric semantic model to produce data-backed answers. "
             "The query must start with EVALUATE. Write/admin commands are blocked."
         ),
     )
@@ -1056,7 +1066,7 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
     @ai_function(
         name="execute_dax_queries",
         description=(
-            "Execute multiple guarded read-only DAX result sets in one semantic-model query operation when possible. "
+            "Execute multiple guarded read-only DAX result sets in one semantic-model query operation when possible to produce data-backed answers. "
             "Pass dax_queries_json as an array of {name, query}. Use this for comparisons."
         ),
     )
