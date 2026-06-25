@@ -17,13 +17,13 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 import uvicorn
 from azure.cosmos import CosmosClient
 from azure.cosmos.exceptions import CosmosResourceNotFoundError
-from azure.identity import ClientSecretCredential, DefaultAzureCredential
+from azure.identity import ClientSecretCredential, DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
@@ -64,6 +64,11 @@ try:
     from agent_framework.foundry import FoundryChatClient
 except ImportError:
     from agent_framework import FoundryChatClient
+
+try:
+    from agent_framework.foundry import AnthropicFoundryClient
+except ImportError:
+    AnthropicFoundryClient = None  # type: ignore[assignment,misc]
 
 load_dotenv()
 
@@ -159,10 +164,53 @@ def _resolve_model_deployment(model_config: dict[str, Any] | None = None) -> str
     )
 
 
+def _is_claude_model(model_config: dict[str, Any] | None = None) -> bool:
+    values = [
+        (model_config or {}).get("deployment_name"),
+        (model_config or {}).get("model_display_name"),
+        (model_config or {}).get("model_name"),
+        (model_config or {}).get("provider"),
+        (model_config or {}).get("publisher"),
+        os.environ.get("model_deployment_name"),
+        os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME"),
+    ]
+    text = " ".join(str(value or "") for value in values).lower()
+    return "claude" in text or "anthropic" in text
+
+
+def _anthropic_foundry_resource_from_endpoint(project_endpoint: str) -> str:
+    host = urlparse(project_endpoint).hostname or ""
+    suffix = ".services.ai.azure.com"
+    if host.endswith(suffix):
+        return host[: -len(suffix)].split(".")[0]
+    return ""
+
+
 def _get_chat_client(model_config: dict[str, Any] | None = None) -> Any:
     """Create a FoundryChatClient using the service principal credential."""
     project_endpoint = (os.environ.get("MAF_FOUNDRY_PROJECT_ENDPOINT") or os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")).rstrip("/")
     deployment_name = _resolve_model_deployment(model_config)
+
+    if _is_claude_model(model_config):
+        logger = logging.getLogger("hosted_agent_runtime")
+        if AnthropicFoundryClient is None:
+            logger.warning("Claude model detected but AnthropicFoundryClient is unavailable; falling back to FoundryChatClient")
+        else:
+            base_url = os.environ.get("ANTHROPIC_FOUNDRY_BASE_URL", "").strip() or None
+            resource = os.environ.get("ANTHROPIC_FOUNDRY_RESOURCE", "").strip() or _anthropic_foundry_resource_from_endpoint(project_endpoint)
+            token_provider = get_bearer_token_provider(_credential(), "https://ai.azure.com/.default")
+            logger.info(
+                "Using AnthropicFoundryClient for Claude model: model=%s, resource=%s, base_url_configured=%s",
+                deployment_name,
+                resource or "",
+                bool(base_url),
+            )
+            return AnthropicFoundryClient(
+                model=deployment_name or None,
+                resource=None if base_url else (resource or None),
+                base_url=base_url,
+                azure_ad_token_provider=token_provider,
+            )
 
     return FoundryChatClient(
         project_endpoint=project_endpoint or None,
@@ -1409,6 +1457,7 @@ async def _run_agent_sse(project: dict[str, Any], message: str, fabric_token: st
     logger = logging.getLogger("hosted_agent_runtime")
     response_id = f"resp_{uuid.uuid4().hex}"
     yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': {'id': response_id, 'status': 'in_progress'}})}\n\n"
+
     metadata_context = _preloaded_semantic_metadata_context(project)
     if metadata_context:
         message = f"{message}\n\n{metadata_context}"
