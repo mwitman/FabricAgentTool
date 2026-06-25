@@ -178,6 +178,35 @@ def _is_claude_model(model_config: dict[str, Any] | None = None) -> bool:
     return "claude" in text or "anthropic" in text
 
 
+def _project_model_config(project: dict[str, Any]) -> dict[str, Any] | None:
+    mode = project.get("deployment_mode")
+    if mode == "standalone":
+        return project.get("standalone_agent", {}).get("model_config")
+    if mode == "orchestrator_only":
+        return project.get("orchestrator_only", {}).get("model_config")
+    return project.get("orchestrator", {}).get("model_config")
+
+
+def _int_env(name: str, default: int | None = None) -> int | None:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _agent_default_options(model_config: dict[str, Any] | None = None) -> dict[str, Any]:
+    options: dict[str, Any] = {}
+    max_tokens = _int_env("AGENT_MAX_TOKENS")
+    if _is_claude_model(model_config):
+        max_tokens = _int_env("CLAUDE_AGENT_MAX_TOKENS", max_tokens or 8192)
+    if max_tokens:
+        options["max_tokens"] = max_tokens
+    return options
+
+
 def _anthropic_foundry_resource_from_endpoint(project_endpoint: str) -> str:
     host = urlparse(project_endpoint).hostname or ""
     suffix = ".services.ai.azure.com"
@@ -381,6 +410,56 @@ def _with_no_progress_narration_policy(prompt: str) -> str:
         "Only return the final answer after all needed tool calls are complete.",
     ]
     return prompt.rstrip() + "\n\n" + "\n".join(policy)
+
+
+def _with_final_answer_streaming_policy(prompt: str) -> str:
+    policy = [
+        "Streaming response policy:",
+        "Do not emit any user-visible text before all required tool calls are complete.",
+        "When the final answer is ready, begin it with the exact line FINAL_ANSWER_START, then write only the final answer.",
+        "Never use FINAL_ANSWER_START for planning, tool progress, IDs being resolved, partial findings, or intermediate analysis.",
+    ]
+    return prompt.rstrip() + "\n\n" + "\n".join(policy)
+
+
+def _strip_final_answer_marker(text: str) -> str:
+    marker = "FINAL_ANSWER_START"
+    if marker not in text:
+        return text
+    return text.split(marker, 1)[1].lstrip(" :\r\n\t")
+
+
+def _strip_progress_narration(text: str) -> str:
+    cleaned = _strip_final_answer_marker(text).lstrip()
+    if not cleaned:
+        return cleaned
+    final_start_patterns = [
+        r"(?m)^\s*#{1,3}\s+\S",
+        r"(?m)^\s*---\s*$",
+        r"(?m)^\s*\|.+\|\s*$",
+        r"(?m)^\s*\*\*[^*]+\*\*\s*$",
+    ]
+    for pattern in final_start_patterns:
+        match = re.search(pattern, cleaned)
+        if match and match.start() > 0:
+            prefix = cleaned[:match.start()].lower()
+            if any(phrase in prefix for phrase in ("let me", "i'll", "now let", "i found", "i have", "retrieved", "resolves to")):
+                return cleaned[match.start():].lstrip()
+    progress_sentence = re.compile(
+        r"^\s*(?:"
+        r"let me[^.?!]*(?:[.?!]|$)|"
+        r"i(?:'ll| will)\s+[^.?!]*(?:[.?!]|$)|"
+        r"now\s+let\s+me[^.?!]*(?:[.?!]|$)|"
+        r"i\s+(?:found|retrieved|have|identified)\s+[^.?!]*(?:[.?!]|$)|"
+        r"[^.?!\n]*\bresolves\s+to\b[^.?!]*(?:[.?!]|$)"
+        r")\s*",
+        re.IGNORECASE,
+    )
+    previous = None
+    while previous != cleaned:
+        previous = cleaned
+        cleaned = progress_sentence.sub("", cleaned, count=1).lstrip()
+    return cleaned
 
 
 def _with_runtime_tool_policy(prompt: str, configured_sources: list[dict[str, Any]]) -> str:
@@ -782,17 +861,13 @@ def _access_token_str() -> str:
 def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str | None = None, tool_wrapper: Any = None) -> ChatAgent:
     """Create a ChatAgent from project config with source-aware Fabric tools."""
     logger = logging.getLogger("hosted_agent_runtime")
-    # Determine model_config based on deployment mode
     mode = project.get("deployment_mode")
-    if mode == "standalone":
-        model_config = project.get("standalone_agent", {}).get("model_config")
-    elif mode == "orchestrator_only":
-        model_config = project.get("orchestrator_only", {}).get("model_config")
-    else:
-        model_config = project.get("orchestrator", {}).get("model_config")
+    model_config = _project_model_config(project)
 
     client = _get_chat_client(model_config)
     instructions = _build_instructions(project)
+    instructions = _with_final_answer_streaming_policy(instructions)
+    default_options = _agent_default_options(model_config)
 
     # For orchestrator_only mode, create tools that invoke external agents
     if mode == "orchestrator_only":
@@ -830,6 +905,7 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
             name=project.get("name", "Orchestrator Agent"),
             description=project.get("description", "An orchestrator that delegates to existing agents."),
             tools=[tool_wrapper(t) for t in tools] if tool_wrapper else tools,
+            default_options=default_options or None,
         )
         setattr(agent, "_fabric_runtime_tool_count", len(tools))
         return agent
@@ -1287,6 +1363,7 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
         name=project.get("name", "Fabric Agent"),
         description=project.get("description", "A Fabric data agent."),
         tools=[tool_wrapper(t) for t in tools] if tool_wrapper else tools,
+        default_options=default_options or None,
     )
     setattr(agent, "_fabric_runtime_tool_count", len(tools))
     return agent
@@ -1379,6 +1456,7 @@ async def _run_agent(project: dict[str, Any], message: str, fabric_token: str, c
             else:
                 response = await agent.run(message)
             result = _agent_response_text(response)
+            result = _strip_progress_narration(result)
             logger.info("Agent response length: %d chars", len(result))
             if not result.strip():
                 logger.warning("Agent returned empty response. Raw response object: %s", repr(response)[:500])
@@ -1400,7 +1478,7 @@ async def _run_agent(project: dict[str, Any], message: str, fabric_token: str, c
                     chunks.append(content.text)
                 elif hasattr(content, "text") and content.text:
                     chunks.append(content.text)
-        result = "".join(chunks)
+        result = _strip_progress_narration("".join(chunks))
         logger.info("Agent stream response length: %d chars", len(result))
         return result
     except Exception as exc:
@@ -1483,6 +1561,7 @@ async def _run_agent_traced(project: dict[str, Any], message: str, fabric_token:
         else:
             response = await agent.run(message)
         result = _agent_response_text(response)
+        result = _strip_final_answer_marker(result)
         logger.info("Agent traced response length: %d chars, tool_calls: %d", len(result), len(tool_trace))
         return {"response": result, "tool_calls": tool_trace}
     except Exception as exc:
@@ -1511,6 +1590,24 @@ async def _run_agent_sse(project: dict[str, Any], message: str, fabric_token: st
 
     thread = _get_or_create_thread(conversation_id)
     full_response: list[str] = []
+    filter_progress = True
+    final_answer_started = not filter_progress
+    buffered_text = ""
+    final_marker = "FINAL_ANSWER_START"
+
+    def _visible_stream_text(text: str) -> str:
+        nonlocal buffered_text, final_answer_started
+        if not filter_progress:
+            return _strip_final_answer_marker(text)
+        if final_answer_started:
+            return _strip_final_answer_marker(text)
+        buffered_text += text
+        if final_marker not in buffered_text:
+            return ""
+        _, after_marker = buffered_text.split(final_marker, 1)
+        buffered_text = ""
+        final_answer_started = True
+        return after_marker.lstrip(" :\r\n\t")
 
     try:
         if hasattr(agent, "run_stream"):
@@ -1555,12 +1652,19 @@ async def _run_agent_sse(project: dict[str, Any], message: str, fabric_token: st
                 elif hasattr(content, "text") and content.text:
                     text = content.text
                 if text:
-                    full_response.append(text)
-                    yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'delta': text})}\n\n"
+                    visible_text = _visible_stream_text(text)
+                    if visible_text:
+                        full_response.append(visible_text)
+                        yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'delta': visible_text})}\n\n"
 
         if timed_out:
-            error_text = "[Agent stream timed out waiting for more Claude output. Try a narrower request or check hosted runtime logs for the last tool call.]"
+            error_text = "[Agent stream timed out waiting for more model output. Try a narrower request or check hosted runtime logs for the last tool call.]"
             yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'delta': error_text})}\n\n"
+        elif filter_progress and not final_answer_started and buffered_text.strip():
+            fallback_text = _strip_progress_narration(buffered_text)
+            logger.warning("Agent stream ended without FINAL_ANSWER_START marker; emitting cleaned buffered text length=%d", len(fallback_text))
+            full_response.append(fallback_text)
+            yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'delta': fallback_text})}\n\n"
 
         logger.info("Agent streamed response length: %d chars", len("".join(full_response)))
         yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': {'id': response_id, 'status': 'completed'}})}\n\n"
