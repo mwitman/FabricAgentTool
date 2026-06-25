@@ -417,6 +417,80 @@ def _source_item_name(data_source: dict[str, Any]) -> str:
     return str(data_source.get("item_name") or data_source.get("semantic_model_name") or "")
 
 
+def _tool_name(tool_obj: Any) -> str:
+    return str(getattr(tool_obj, "name", None) or getattr(tool_obj, "__name__", None) or type(tool_obj).__name__)
+
+
+def _compact_semantic_metadata(metadata: dict[str, Any], max_tables: int = 30, max_fields_per_table: int = 40) -> dict[str, Any]:
+    tables_payload = metadata.get("tables") if isinstance(metadata.get("tables"), dict) else {}
+    tables = tables_payload.get("value") if isinstance(tables_payload.get("value"), list) else []
+    compact_tables: list[dict[str, Any]] = []
+    for table in tables[:max_tables]:
+        if not isinstance(table, dict):
+            continue
+        columns = table.get("columns") if isinstance(table.get("columns"), list) else []
+        measures = table.get("measures") if isinstance(table.get("measures"), list) else []
+        compact_tables.append({
+            "name": table.get("name") or table.get("tableName"),
+            "columns": [column.get("name") or column.get("columnName") for column in columns[:max_fields_per_table] if isinstance(column, dict)],
+            "measures": [measure.get("name") or measure.get("measureName") for measure in measures[:max_fields_per_table] if isinstance(measure, dict)],
+        })
+    return {
+        "workspace_id": metadata.get("workspace_id"),
+        "semantic_model_id": metadata.get("semantic_model_id"),
+        "semantic_model_name": metadata.get("semantic_model_name"),
+        "metadata_source": metadata.get("metadata_source"),
+        "refreshed_at": metadata.get("refreshed_at"),
+        "table_count": len(tables),
+        "tables": compact_tables,
+        "relationships": metadata.get("relationships") or [],
+        "ai_instructions": metadata.get("ai_instructions") or "",
+    }
+
+
+def _preloaded_semantic_metadata_context(project: dict[str, Any]) -> str:
+    semantic_models = _get_semantic_models(project)
+    if not semantic_models:
+        return ""
+    logger = logging.getLogger("hosted_agent_runtime.metadata")
+    cache_hits = 0
+    cache_misses = 0
+    compact_models: list[dict[str, Any]] = []
+    missing_models: list[dict[str, str]] = []
+    for source in semantic_models:
+        workspace_id = str(source.get("workspace_id") or "")
+        semantic_model_id = _source_item_id(source)
+        if not workspace_id or not semantic_model_id:
+            continue
+        metadata = _semantic_metadata_from_cache(workspace_id, semantic_model_id)
+        if metadata and metadata.get("tables", {}).get("value"):
+            cache_hits += 1
+            compact_models.append(_compact_semantic_metadata(metadata))
+        else:
+            cache_misses += 1
+            missing_models.append({
+                "workspace_id": workspace_id,
+                "semantic_model_id": semantic_model_id,
+                "semantic_model_name": _source_item_name(source),
+            })
+    logger.info(
+        "Runtime semantic metadata preloaded: semantic_models=%d, cache_hits=%d, cache_misses=%d",
+        len(semantic_models),
+        cache_hits,
+        cache_misses,
+    )
+    if not compact_models and not missing_models:
+        return ""
+    payload = {"models": compact_models, "cache_misses": missing_models}
+    return (
+        "Runtime semantic metadata context was preloaded before this turn. "
+        "Use this metadata to choose tables, columns, and measures. "
+        "For data-backed answers, call execute_dax_query or execute_dax_queries with the configured workspace_id and semantic_model_id. "
+        "Do not say you will start by getting metadata; metadata is already provided here.\n"
+        f"```json\n{json.dumps(payload, indent=2)}\n```"
+    )
+
+
 def _is_readonly_sql(query: str) -> bool:
     normalized = re.sub(r"--.*?$|/\*.*?\*/", " ", query, flags=re.MULTILINE | re.DOTALL).strip().lower()
     if not (normalized.startswith("select") or normalized.startswith("with")):
@@ -660,9 +734,10 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
                 tools.append(_make_invoke_tool(agent_name, display_name, description))
 
         logger.info(
-            "Runtime tools prepared: mode=%s, tools=%d, external_agents=%d",
+            "Runtime tools prepared: mode=%s, tools=%d, tool_names=%s, external_agents=%d",
             mode,
             len(tools),
+            ",".join(_tool_name(tool) for tool in tools),
             len(external_agents),
         )
         agent = ChatAgent(
@@ -1109,9 +1184,10 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
         tools.extend([call_fabric_mcp, call_fabric_mcp_tool])
 
     logger.info(
-        "Runtime tools prepared: mode=%s, tools=%d, data_sources=%d, semantic_models=%d, graphql_sources=%d, sql_sources=%d, data_agent_sources=%d, uses_fabric_mcp=%s",
+        "Runtime tools prepared: mode=%s, tools=%d, tool_names=%s, data_sources=%d, semantic_models=%d, graphql_sources=%d, sql_sources=%d, data_agent_sources=%d, uses_fabric_mcp=%s",
         mode,
         len(tools),
+        ",".join(_tool_name(tool) for tool in tools),
         len(data_sources),
         len(semantic_models),
         len(graphql_sources),
@@ -1199,6 +1275,9 @@ async def responses(request: Request):
 async def _run_agent(project: dict[str, Any], message: str, fabric_token: str, conversation_id: str, powerbi_token: str | None = None) -> str:
     import logging
     logger = logging.getLogger("hosted_agent_runtime")
+    metadata_context = _preloaded_semantic_metadata_context(project)
+    if metadata_context:
+        message = f"{message}\n\n{metadata_context}"
     try:
         agent = _create_agent(project, fabric_token, powerbi_token, tool_wrapper=_make_tool_trace_wrapper(conversation_id))
         logger.info("Agent created: mode=%s, tools=%d", project.get("deployment_mode"), getattr(agent, "_fabric_runtime_tool_count", len(getattr(agent, "tools", []) or [])))
@@ -1309,6 +1388,9 @@ async def _run_agent_traced(project: dict[str, Any], message: str, fabric_token:
         return {"response": f"[Agent creation error: {exc}]", "tool_calls": tool_trace, "error": True}
 
     thread = _get_or_create_thread(conversation_id)
+    metadata_context = _preloaded_semantic_metadata_context(project)
+    if metadata_context:
+        message = f"{message}\n\n{metadata_context}"
     try:
         if thread is not None:
             response = await agent.run(message, session=thread)
@@ -1327,6 +1409,9 @@ async def _run_agent_sse(project: dict[str, Any], message: str, fabric_token: st
     logger = logging.getLogger("hosted_agent_runtime")
     response_id = f"resp_{uuid.uuid4().hex}"
     yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': {'id': response_id, 'status': 'in_progress'}})}\n\n"
+    metadata_context = _preloaded_semantic_metadata_context(project)
+    if metadata_context:
+        message = f"{message}\n\n{metadata_context}"
 
     try:
         agent = _create_agent(project, fabric_token, powerbi_token, tool_wrapper=_make_tool_trace_wrapper(conversation_id))
