@@ -28,6 +28,32 @@ function Read-DotEnv {
     return $values
 }
 
+function Test-DockerAvailable {
+    $dockerCommand = Get-Command docker -ErrorAction SilentlyContinue
+    if (-not $dockerCommand) {
+        return $false
+    }
+    try {
+        docker version --format '{{.Server.Version}}' *> $null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
+}
+
+function Invoke-NativeCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$Arguments
+    )
+    & $FilePath @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command failed with exit code $LASTEXITCODE`: $FilePath $($Arguments -join ' ')"
+    }
+}
+
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $runtimeRoot = Join-Path $scriptRoot "hosted_agent_runtime"
 $envValues = Read-DotEnv (Join-Path $scriptRoot ".env")
@@ -56,43 +82,43 @@ if (-not $Tags -or $Tags.Count -eq 0) {
     $Tags = @("latest", $timestampTag)
 }
 
-$docker = Get-Command docker -ErrorAction SilentlyContinue
+$dockerAvailable = Test-DockerAvailable
 $az = Get-Command az -ErrorAction SilentlyContinue
-if (-not $docker -and -not $az) {
-    throw "Docker is not installed, and Azure CLI was not found. Install Docker or Azure CLI to build the hosted runtime image."
+if (-not $dockerAvailable -and -not $az) {
+    throw "Docker is not available, and Azure CLI was not found. Install or start Docker, or install Azure CLI to build in ACR."
 }
-if (-not $docker -and -not $AcrName) {
-    throw "Docker is not installed, so ACR remote build requires ACR_NAME in .env or -AcrName."
+if (-not $dockerAvailable -and -not $AcrName) {
+    throw "Docker is not available, so ACR remote build requires ACR_NAME in .env or -AcrName."
 }
-if (-not $az -and -not $SkipLogin) {
+if (-not $az -and -not $SkipLogin -and $AcrName) {
     throw "Azure CLI is required for 'az acr login'. Install Azure CLI or rerun with -SkipLogin after logging in another way."
 }
 
 if ($Subscription) {
-    az account set --subscription $Subscription | Out-Null
+    Invoke-NativeCommand az account set --subscription $Subscription | Out-Null
 }
 
 if (-not $SkipLogin) {
-    if ($AcrName -and $docker) {
-        az acr login --name $AcrName | Out-Null
-    } elseif ($docker) {
-        docker login $AcrLoginServer
+    if ($AcrName -and $dockerAvailable) {
+        Invoke-NativeCommand az acr login --name $AcrName | Out-Null
+    } elseif ($dockerAvailable) {
+        Invoke-NativeCommand docker login $AcrLoginServer
     }
 }
 
 $fullTags = $Tags | ForEach-Object { "$AcrLoginServer/$ImageName`:$_" }
 $primaryTag = if ($fullTags.Count -gt 1) { $fullTags[1] } else { $fullTags[0] }
 
-if (-not $docker) {
+if (-not $dockerAvailable) {
     if ($SkipBuild) {
-        throw "Docker is not installed, so -SkipBuild cannot push an existing local image. Remove -SkipBuild to use 'az acr build'."
+        throw "Docker is not available, so -SkipBuild cannot push an existing local image. Remove -SkipBuild to use 'az acr build'."
     }
     $imageArgs = @()
     foreach ($tag in $Tags) {
         $imageArgs += @("--image", "$ImageName`:$tag")
     }
-    Write-Host "Docker was not found. Building in Azure Container Registry with 'az acr build'."
-    az acr build --registry $AcrName --platform $Platform @imageArgs $runtimeRoot
+    Write-Host "Docker is not available. Building in Azure Container Registry with 'az acr build'."
+    Invoke-NativeCommand az acr build --registry $AcrName --platform $Platform @imageArgs $runtimeRoot
 } elseif (-not $SkipBuild) {
     Push-Location $runtimeRoot
     try {
@@ -100,15 +126,15 @@ if (-not $docker) {
         foreach ($tag in $fullTags) {
             $tagArgs += @("-t", $tag)
         }
-        docker build --platform $Platform @tagArgs .
+        Invoke-NativeCommand docker build --platform $Platform @tagArgs .
     } finally {
         Pop-Location
     }
 }
 
-if ($docker) {
+if ($dockerAvailable) {
     foreach ($tag in $fullTags) {
-        docker push $tag
+        Invoke-NativeCommand docker push $tag
     }
 }
 
