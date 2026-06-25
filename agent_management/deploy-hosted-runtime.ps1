@@ -41,6 +41,9 @@ if (-not $AcrLoginServer -and $envValues.ContainsKey("ACR_LOGIN_SERVER")) {
 if (-not $AcrLoginServer -and $AcrName) {
     $AcrLoginServer = "$AcrName.azurecr.io"
 }
+if (-not $AcrName -and $AcrLoginServer -match "^([^.]+)\.") {
+    $AcrName = $Matches[1]
+}
 if (-not $AcrLoginServer) {
     throw "ACR login server is required. Set ACR_LOGIN_SERVER in .env or pass -AcrLoginServer."
 }
@@ -54,11 +57,13 @@ if (-not $Tags -or $Tags.Count -eq 0) {
 }
 
 $docker = Get-Command docker -ErrorAction SilentlyContinue
-if (-not $docker) {
-    throw "Docker is required to build and push the hosted runtime image."
-}
-
 $az = Get-Command az -ErrorAction SilentlyContinue
+if (-not $docker -and -not $az) {
+    throw "Docker is not installed, and Azure CLI was not found. Install Docker or Azure CLI to build the hosted runtime image."
+}
+if (-not $docker -and -not $AcrName) {
+    throw "Docker is not installed, so ACR remote build requires ACR_NAME in .env or -AcrName."
+}
 if (-not $az -and -not $SkipLogin) {
     throw "Azure CLI is required for 'az acr login'. Install Azure CLI or rerun with -SkipLogin after logging in another way."
 }
@@ -68,9 +73,9 @@ if ($Subscription) {
 }
 
 if (-not $SkipLogin) {
-    if ($AcrName) {
+    if ($AcrName -and $docker) {
         az acr login --name $AcrName | Out-Null
-    } else {
+    } elseif ($docker) {
         docker login $AcrLoginServer
     }
 }
@@ -78,7 +83,17 @@ if (-not $SkipLogin) {
 $fullTags = $Tags | ForEach-Object { "$AcrLoginServer/$ImageName`:$_" }
 $primaryTag = if ($fullTags.Count -gt 1) { $fullTags[1] } else { $fullTags[0] }
 
-if (-not $SkipBuild) {
+if (-not $docker) {
+    if ($SkipBuild) {
+        throw "Docker is not installed, so -SkipBuild cannot push an existing local image. Remove -SkipBuild to use 'az acr build'."
+    }
+    $imageArgs = @()
+    foreach ($tag in $Tags) {
+        $imageArgs += @("--image", "$ImageName`:$tag")
+    }
+    Write-Host "Docker was not found. Building in Azure Container Registry with 'az acr build'."
+    az acr build --registry $AcrName --platform $Platform @imageArgs $runtimeRoot
+} elseif (-not $SkipBuild) {
     Push-Location $runtimeRoot
     try {
         $tagArgs = @()
@@ -91,8 +106,10 @@ if (-not $SkipBuild) {
     }
 }
 
-foreach ($tag in $fullTags) {
-    docker push $tag
+if ($docker) {
+    foreach ($tag in $fullTags) {
+        docker push $tag
+    }
 }
 
 Write-Host "Hosted runtime image pushed:"
