@@ -369,7 +369,7 @@ def _build_instructions(project: dict[str, Any]) -> str:
             f"{agent.get('description', '')} "
             f"You answer questions using {model_name}. "
             "For any question that asks about data, fields, entities, measures, identity resolution, filtering, counts, totals, trends, or records, call get_semantic_model_metadata first and then call execute_dax_query or execute_dax_queries before answering. "
-            "Do not answer with a plan such as 'I'll start by...' or say you are going to get metadata; call the tool instead. "
+            "Do not answer with a plan or say you are going to get metadata; call the tool instead. "
             "Answer from tool results, and say what failed if a required tool call fails."
         )
     if mode == "orchestrator_only":
@@ -406,7 +406,7 @@ def _with_no_progress_narration_policy(prompt: str) -> str:
     policy = [
         "Response policy:",
         "Use tools silently. Do not narrate intermediate steps, tool plans, IDs being resolved, peer-selection process, partial findings, or progress updates.",
-        "Do not say 'I'll start', 'Let me', 'Now I need', 'I found', 'I've identified', 'Next', or similar process narration while working.",
+        "Do not include process narration while working.",
         "Only return the final answer after all needed tool calls are complete.",
     ]
     return prompt.rstrip() + "\n\n" + "\n".join(policy)
@@ -442,24 +442,63 @@ def _strip_progress_narration(text: str) -> str:
     for pattern in final_start_patterns:
         match = re.search(pattern, cleaned)
         if match and match.start() > 0:
-            prefix = cleaned[:match.start()].lower()
-            if any(phrase in prefix for phrase in ("let me", "i'll", "now let", "i found", "i have", "retrieved", "resolves to")):
+            prefix = cleaned[:match.start()].strip()
+            if _looks_like_progress_prelude(prefix):
                 return cleaned[match.start():].lstrip()
-    progress_sentence = re.compile(
-        r"^\s*(?:"
-        r"let me[^.?!]*(?:[.?!]|$)|"
-        r"i(?:'ll| will)\s+[^.?!]*(?:[.?!]|$)|"
-        r"now\s+let\s+me[^.?!]*(?:[.?!]|$)|"
-        r"i\s+(?:found|retrieved|have|identified)\s+[^.?!]*(?:[.?!]|$)|"
-        r"[^.?!\n]*\bresolves\s+to\b[^.?!]*(?:[.?!]|$)"
-        r")\s*",
-        re.IGNORECASE,
-    )
+    return _strip_leading_progress_sentences(cleaned)
+
+
+def _looks_like_progress_prelude(text: str) -> bool:
+    if not text:
+        return False
+    sentences = _leading_sentences(text)
+    if len(sentences) >= 2:
+        return True
+    return bool(sentences and _looks_like_progress_sentence(sentences[0]))
+
+
+def _strip_leading_progress_sentences(text: str) -> str:
+    cleaned = text
     previous = None
     while previous != cleaned:
         previous = cleaned
-        cleaned = progress_sentence.sub("", cleaned, count=1).lstrip()
+        sentence = _first_sentence(cleaned)
+        if not sentence or not _looks_like_progress_sentence(sentence):
+            break
+        cleaned = cleaned[len(sentence):].lstrip()
     return cleaned
+
+
+def _leading_sentences(text: str, limit: int = 8) -> list[str]:
+    sentences = []
+    remaining = text.lstrip()
+    while remaining and len(sentences) < limit:
+        sentence = _first_sentence(remaining)
+        if not sentence:
+            break
+        sentences.append(sentence)
+        remaining = remaining[len(sentence):].lstrip()
+    return sentences
+
+
+def _first_sentence(text: str) -> str:
+    match = re.match(r"(?s)^\s*.*?(?:[.?!](?=\s|[A-Z#*|`-])|\n\s*\n|$)", text)
+    return match.group(0) if match else ""
+
+
+def _looks_like_progress_sentence(sentence: str) -> bool:
+    stripped = sentence.strip()
+    if not stripped:
+        return False
+    lower = stripped.lower()
+    first_word = re.match(r"^[a-z]+", lower)
+    if first_word and first_word.group(0).endswith("ing"):
+        return True
+    if re.match(r"^(?:i\b|now\b|next\b|then\b|wait\b)", lower):
+        return True
+    if re.search(r"\b(?:id|identifier|key)\b\s*(?:=|:)", lower):
+        return True
+    return False
 
 
 def _with_runtime_tool_policy(prompt: str, configured_sources: list[dict[str, Any]]) -> str:
@@ -478,7 +517,7 @@ def _with_runtime_tool_policy(prompt: str, configured_sources: list[dict[str, An
             "For semantic-model questions about data, fields, entities, measures, identity resolution, filtering, counts, totals, trends, records, or DAX, call get_semantic_model_metadata before answering.",
             "For data-backed answers, call execute_dax_query or execute_dax_queries after metadata is available; do not answer from assumptions or prompt text alone.",
             "When an answer needs multiple independent result sets, comparisons, validations, breakdowns, totals plus details, or more than one EVALUATE statement, prefer execute_dax_queries and pass all queries in dax_queries_json so they can run in one semantic-model operation.",
-            "Do not respond with a plan such as 'I'll start by getting metadata'; make the tool call in the same turn instead.",
+            "Do not respond with a plan before calling required tools; make the tool call in the same turn instead.",
             "If a required metadata or DAX tool call fails, report the failure and include the relevant error details from the tool result.",
         ])
     if has_fabric_mcp:
@@ -635,7 +674,7 @@ def _preloaded_semantic_metadata_context(project: dict[str, Any]) -> str:
         "Use this metadata to choose tables, columns, and measures. "
         "For data-backed answers, call execute_dax_query or execute_dax_queries with the configured workspace_id and semantic_model_id. "
         "If the answer requires multiple independent result sets, comparisons, validations, breakdowns, totals plus details, or more than one EVALUATE statement, use execute_dax_queries and include every query in one dax_queries_json array. "
-        "Do not say you will start by getting metadata; metadata is already provided here.\n"
+        "Do not narrate metadata preparation; metadata is already provided here.\n"
         f"```json\n{json.dumps(payload, indent=2)}\n```"
     )
 
