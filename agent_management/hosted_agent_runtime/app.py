@@ -757,6 +757,20 @@ def _extract_sse_final_text(event_data: dict[str, Any]) -> str:
     return ""
 
 
+def _agent_stream_keepalive_seconds() -> int:
+    try:
+        return max(5, int(os.environ.get("AGENT_STREAM_KEEPALIVE_SECONDS", "15")))
+    except ValueError:
+        return 15
+
+
+def _agent_stream_idle_timeout_seconds() -> int:
+    try:
+        return max(_agent_stream_keepalive_seconds(), int(os.environ.get("AGENT_STREAM_IDLE_TIMEOUT_SECONDS", "240")))
+    except ValueError:
+        return 240
+
+
 def _access_token_str() -> str:
     """Get an access token string for calling Foundry APIs."""
     credential = _credential()
@@ -1509,7 +1523,30 @@ async def _run_agent_sse(project: dict[str, Any], message: str, fabric_token: st
         else:
             stream = agent.run(message, stream=True)
 
-        async for update in stream:
+        iterator = stream.__aiter__()
+        pending_update = asyncio.create_task(iterator.__anext__())
+        last_update_at = time.time()
+        keepalive_seconds = _agent_stream_keepalive_seconds()
+        idle_timeout_seconds = _agent_stream_idle_timeout_seconds()
+        timed_out = False
+
+        while True:
+            done, _ = await asyncio.wait({pending_update}, timeout=keepalive_seconds)
+            if not done:
+                idle_seconds = round(time.time() - last_update_at)
+                yield f": keepalive idle_seconds={idle_seconds}\n\n"
+                if idle_seconds >= idle_timeout_seconds:
+                    logger.error("Agent stream idle timeout after %s seconds", idle_seconds)
+                    pending_update.cancel()
+                    timed_out = True
+                    break
+                continue
+            try:
+                update = pending_update.result()
+            except StopAsyncIteration:
+                break
+            last_update_at = time.time()
+            pending_update = asyncio.create_task(iterator.__anext__())
             contents = getattr(update, "contents", None) or []
             for content in contents:
                 text = ""
@@ -1520,6 +1557,10 @@ async def _run_agent_sse(project: dict[str, Any], message: str, fabric_token: st
                 if text:
                     full_response.append(text)
                     yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'delta': text})}\n\n"
+
+        if timed_out:
+            error_text = "[Agent stream timed out waiting for more Claude output. Try a narrower request or check hosted runtime logs for the last tool call.]"
+            yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'delta': error_text})}\n\n"
 
         logger.info("Agent streamed response length: %d chars", len("".join(full_response)))
         yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': {'id': response_id, 'status': 'completed'}})}\n\n"
