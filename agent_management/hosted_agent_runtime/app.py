@@ -190,9 +190,19 @@ def _get_chat_client(model_config: dict[str, Any] | None = None) -> Any:
     """Create a FoundryChatClient using the service principal credential."""
     project_endpoint = (os.environ.get("MAF_FOUNDRY_PROJECT_ENDPOINT") or os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "")).rstrip("/")
     deployment_name = _resolve_model_deployment(model_config)
+    logger = logging.getLogger("hosted_agent_runtime")
+    is_claude = _is_claude_model(model_config)
+    logger.info(
+        "Runtime model client routing: deployment_name=%s, model_name=%s, model_display_name=%s, provider=%s, publisher=%s, is_claude=%s",
+        deployment_name,
+        (model_config or {}).get("model_name", ""),
+        (model_config or {}).get("model_display_name", ""),
+        (model_config or {}).get("provider", ""),
+        (model_config or {}).get("publisher", ""),
+        is_claude,
+    )
 
-    if _is_claude_model(model_config):
-        logger = logging.getLogger("hosted_agent_runtime")
+    if is_claude:
         if AnthropicFoundryClient is None:
             logger.warning("Claude model detected but AnthropicFoundryClient is unavailable; falling back to FoundryChatClient")
         else:
