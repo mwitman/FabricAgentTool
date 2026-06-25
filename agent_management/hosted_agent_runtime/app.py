@@ -327,7 +327,7 @@ def _build_instructions(project: dict[str, Any]) -> str:
         if agent.get("prompt"):
             return _with_runtime_tool_policy(agent["prompt"], configured_sources)
         if _uses_non_semantic_fabric(project):
-            return (
+            return _with_no_progress_narration_policy(
                 f"You are {agent.get('name', 'a Fabric agent')}. "
                 f"{agent.get('description', '')} "
                 f"Configured data sources: {source_summary}. "
@@ -335,7 +335,7 @@ def _build_instructions(project: dict[str, Any]) -> str:
                 "For Fabric MCP, discover accessible Fabric items first, then use the matching semantic model, GraphQL, SQL endpoint, Data Agent, or item definition tool."
             )
         model_name = _source_item_name(agent.get("semantic_model", {})) or "the configured semantic model"
-        return (
+        return _with_no_progress_narration_policy(
             f"You are {agent.get('name', 'a Fabric semantic model agent')}. "
             f"{agent.get('description', '')} "
             f"You answer questions using {model_name}. "
@@ -351,7 +351,7 @@ def _build_instructions(project: dict[str, Any]) -> str:
             f"- {a.get('display_name') or a.get('agent_name', 'agent')}: {a.get('description', 'no description')}"
             for a in orch.get("external_agents", [])
         ]
-        return (
+        return _with_no_progress_narration_policy(
             f"You are {orch.get('name', 'an orchestrator agent')}. "
             f"{orch.get('description', '')} "
             f"You delegate tasks to existing deployed agents:\n"
@@ -363,7 +363,7 @@ def _build_instructions(project: dict[str, Any]) -> str:
     if orchestrator.get("prompt"):
         return _with_runtime_tool_policy(orchestrator["prompt"], configured_sources)
     subagent_names = [s.get("name", "subagent") for s in orchestrator.get("subagents", [])]
-    return (
+    return _with_no_progress_narration_policy(
         f"You are {orchestrator.get('name', 'an orchestrator agent')}. "
         f"{orchestrator.get('description', '')} "
         f"You route questions to subagents: {', '.join(subagent_names)}. "
@@ -373,9 +373,19 @@ def _build_instructions(project: dict[str, Any]) -> str:
     )
 
 
+def _with_no_progress_narration_policy(prompt: str) -> str:
+    policy = [
+        "Response policy:",
+        "Use tools silently. Do not narrate intermediate steps, tool plans, IDs being resolved, peer-selection process, partial findings, or progress updates.",
+        "Do not say 'I'll start', 'Let me', 'Now I need', 'I found', 'I've identified', 'Next', or similar process narration while working.",
+        "Only return the final answer after all needed tool calls are complete.",
+    ]
+    return prompt.rstrip() + "\n\n" + "\n".join(policy)
+
+
 def _with_runtime_tool_policy(prompt: str, configured_sources: list[dict[str, Any]]) -> str:
     if not configured_sources:
-        return prompt
+        return _with_no_progress_narration_policy(prompt)
     data_agent_sources = [source for source in configured_sources if source.get("source_type") == "data_agent"]
     semantic_sources = [source for source in configured_sources if source.get("source_type") == "semantic_model"]
     has_fabric_mcp = any(_source_type(source) == "fabric_mcp" for source in configured_sources)
@@ -388,6 +398,7 @@ def _with_runtime_tool_policy(prompt: str, configured_sources: list[dict[str, An
         policy.extend([
             "For semantic-model questions about data, fields, entities, measures, identity resolution, filtering, counts, totals, trends, records, or DAX, call get_semantic_model_metadata before answering.",
             "For data-backed answers, call execute_dax_query or execute_dax_queries after metadata is available; do not answer from assumptions or prompt text alone.",
+            "When an answer needs multiple independent result sets, comparisons, validations, breakdowns, totals plus details, or more than one EVALUATE statement, prefer execute_dax_queries and pass all queries in dax_queries_json so they can run in one semantic-model operation.",
             "Do not respond with a plan such as 'I'll start by getting metadata'; make the tool call in the same turn instead.",
             "If a required metadata or DAX tool call fails, report the failure and include the relevant error details from the tool result.",
         ])
@@ -403,7 +414,7 @@ def _with_runtime_tool_policy(prompt: str, configured_sources: list[dict[str, An
             "Invoke invoke_fabric_data_agent with the user's question before refusing or narrowing the request.",
             "Pass the user's analytical question through to the Fabric Data Agent; do not reject it solely because it is broad.",
         ])
-    return prompt.rstrip() + "\n\n" + "\n".join(policy)
+    return _with_no_progress_narration_policy(prompt.rstrip() + "\n\n" + "\n".join(policy))
 
 
 def _get_configured_data_sources(project: dict[str, Any]) -> list[dict[str, Any]]:
@@ -544,6 +555,7 @@ def _preloaded_semantic_metadata_context(project: dict[str, Any]) -> str:
         "Runtime semantic metadata context was preloaded before this turn. "
         "Use this metadata to choose tables, columns, and measures. "
         "For data-backed answers, call execute_dax_query or execute_dax_queries with the configured workspace_id and semantic_model_id. "
+        "If the answer requires multiple independent result sets, comparisons, validations, breakdowns, totals plus details, or more than one EVALUATE statement, use execute_dax_queries and include every query in one dax_queries_json array. "
         "Do not say you will start by getting metadata; metadata is already provided here.\n"
         f"```json\n{json.dumps(payload, indent=2)}\n```"
     )
@@ -1184,7 +1196,8 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
     @ai_function(
         name="execute_dax_query",
         description=(
-            "Execute a guarded read-only DAX query against a Fabric semantic model to produce data-backed answers. "
+            "Execute one guarded read-only DAX query against a Fabric semantic model to produce a single result set. "
+            "Use execute_dax_queries instead when the answer needs multiple result sets, comparisons, validations, breakdowns, totals plus details, or more than one EVALUATE statement. "
             "The query must start with EVALUATE. Write/admin commands are blocked."
         ),
     )
@@ -1200,7 +1213,8 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
         name="execute_dax_queries",
         description=(
             "Execute multiple guarded read-only DAX result sets in one semantic-model query operation when possible to produce data-backed answers. "
-            "Pass dax_queries_json as an array of {name, query}. Use this for comparisons."
+            "Prefer this tool for comparisons, validations, breakdowns, totals plus details, or any answer that needs more than one EVALUATE statement. "
+            "Pass dax_queries_json as a JSON array of {name, query} objects, with each query starting with EVALUATE."
         ),
     )
     async def execute_dax_queries(workspace_id: str, semantic_model_id: str, dax_queries_json: str) -> str:
