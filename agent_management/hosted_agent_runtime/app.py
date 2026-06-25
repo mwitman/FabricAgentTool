@@ -613,6 +613,7 @@ def _access_token_str() -> str:
 
 def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str | None = None, tool_wrapper: Any = None) -> ChatAgent:
     """Create a ChatAgent from project config with source-aware Fabric tools."""
+    logger = logging.getLogger("hosted_agent_runtime")
     # Determine model_config based on deployment mode
     mode = project.get("deployment_mode")
     if mode == "standalone":
@@ -648,13 +649,21 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
             if agent_name:
                 tools.append(_make_invoke_tool(agent_name, display_name, description))
 
-        return ChatAgent(
+        logger.info(
+            "Runtime tools prepared: mode=%s, tools=%d, external_agents=%d",
+            mode,
+            len(tools),
+            len(external_agents),
+        )
+        agent = ChatAgent(
             client,
             instructions=instructions,
             name=project.get("name", "Orchestrator Agent"),
             description=project.get("description", "An orchestrator that delegates to existing agents."),
             tools=[tool_wrapper(t) for t in tools] if tool_wrapper else tools,
         )
+        setattr(agent, "_fabric_runtime_tool_count", len(tools))
+        return agent
 
     data_sources = _get_configured_data_sources(project)
     semantic_models = _get_semantic_models(project)
@@ -1089,13 +1098,26 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
     if uses_fabric_mcp:
         tools.extend([call_fabric_mcp, call_fabric_mcp_tool])
 
-    return ChatAgent(
+    logger.info(
+        "Runtime tools prepared: mode=%s, tools=%d, data_sources=%d, semantic_models=%d, graphql_sources=%d, sql_sources=%d, data_agent_sources=%d, uses_fabric_mcp=%s",
+        mode,
+        len(tools),
+        len(data_sources),
+        len(semantic_models),
+        len(graphql_sources),
+        len(sql_sources),
+        len(data_agent_sources),
+        uses_fabric_mcp,
+    )
+    agent = ChatAgent(
         client,
         instructions=instructions,
         name=project.get("name", "Fabric Agent"),
         description=project.get("description", "A Fabric data agent."),
         tools=[tool_wrapper(t) for t in tools] if tool_wrapper else tools,
     )
+    setattr(agent, "_fabric_runtime_tool_count", len(tools))
+    return agent
 
 
 # ---------------------------------------------------------------------------
@@ -1169,7 +1191,7 @@ async def _run_agent(project: dict[str, Any], message: str, fabric_token: str, c
     logger = logging.getLogger("hosted_agent_runtime")
     try:
         agent = _create_agent(project, fabric_token, powerbi_token, tool_wrapper=_make_tool_trace_wrapper(conversation_id))
-        logger.info("Agent created: mode=%s, tools=%d", project.get("deployment_mode"), len(getattr(agent, "tools", []) or []))
+        logger.info("Agent created: mode=%s, tools=%d", project.get("deployment_mode"), getattr(agent, "_fabric_runtime_tool_count", len(getattr(agent, "tools", []) or [])))
     except Exception as exc:
         logger.exception("Failed to create agent")
         return f"[Agent creation error: {exc}]"
@@ -1271,7 +1293,7 @@ async def _run_agent_traced(project: dict[str, Any], message: str, fabric_token:
 
     try:
         agent = _create_agent(project, fabric_token, powerbi_token, tool_wrapper=_make_wrapper)
-        logger.info("Agent created (traced): mode=%s, tools=%d", project.get("deployment_mode"), len(getattr(agent, "tools", []) or []))
+        logger.info("Agent created (traced): mode=%s, tools=%d", project.get("deployment_mode"), getattr(agent, "_fabric_runtime_tool_count", len(getattr(agent, "tools", []) or [])))
     except Exception as exc:
         logger.exception("Failed to create agent")
         return {"response": f"[Agent creation error: {exc}]", "tool_calls": tool_trace, "error": True}
@@ -1298,7 +1320,7 @@ async def _run_agent_sse(project: dict[str, Any], message: str, fabric_token: st
 
     try:
         agent = _create_agent(project, fabric_token, powerbi_token, tool_wrapper=_make_tool_trace_wrapper(conversation_id))
-        logger.info("Agent created for stream: mode=%s, tools=%d", project.get("deployment_mode"), len(getattr(agent, "tools", []) or []))
+        logger.info("Agent created for stream: mode=%s, tools=%d", project.get("deployment_mode"), getattr(agent, "_fabric_runtime_tool_count", len(getattr(agent, "tools", []) or [])))
     except Exception as exc:
         logger.exception("Failed to create streaming agent")
         async for event in _stream_sse(f"[Agent creation error: {exc}]", conversation_id):
