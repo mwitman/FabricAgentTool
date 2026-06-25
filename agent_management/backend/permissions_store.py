@@ -75,6 +75,19 @@ def _configured_bootstrap_admin_members() -> list[RoleMember]:
     return members
 
 
+def _configured_bootstrap_developer_members() -> list[RoleMember]:
+    raw = os.environ.get("AGENT_MGMT_BOOTSTRAP_DEVELOPER_OBJECT_IDS", "")
+    members: list[RoleMember] = []
+    seen: set[str] = set()
+    for item in raw.replace(";", ",").split(","):
+        object_id = item.strip()
+        if not object_id or object_id.lower() in seen:
+            continue
+        seen.add(object_id.lower())
+        members.append(RoleMember(object_id=object_id, display_name="Bootstrap developer", member_type="user"))
+    return members
+
+
 def _bootstrap_admin_match(user_object_id: str, group_ids: list[str]) -> tuple[str, str] | None:
     configured_ids = _configured_bootstrap_admin_ids()
     if not configured_ids:
@@ -96,6 +109,7 @@ def _ensure_bootstrap_admin_role(
 ) -> list[dict[str, Any]]:
     roles = _ensure_configured_admin_role(roles, save_role)
     roles = _ensure_developer_role(roles, save_role)
+    roles = _ensure_configured_developer_role(roles, save_role)
     match = _bootstrap_admin_match(user_object_id, group_ids)
     if match is None:
         return roles
@@ -145,6 +159,33 @@ def _ensure_configured_admin_role(roles: list[dict[str, Any]], save_role) -> lis
     return updated_roles
 
 
+def _ensure_configured_developer_role(roles: list[dict[str, Any]], save_role) -> list[dict[str, Any]]:
+    configured_members = _configured_bootstrap_developer_members()
+    if not configured_members:
+        return roles
+
+    developer_role_index = next((index for index, role in enumerate(roles) if _is_developer_role(role)), None)
+    if developer_role_index is None:
+        saved = save_role(Role(name="Developer", description="Can create and modify agents but cannot delete them.", members=configured_members))
+        return [*roles, saved.model_dump(mode="json")]
+
+    role = Role.model_validate(roles[developer_role_index])
+    existing_ids = {member.object_id.lower() for member in role.members}
+    changed = False
+    for member in configured_members:
+        if member.object_id.lower() not in existing_ids:
+            role.members.append(member)
+            existing_ids.add(member.object_id.lower())
+            changed = True
+    if not changed:
+        return roles
+
+    saved = save_role(role)
+    updated_roles = [*roles]
+    updated_roles[developer_role_index] = saved.model_dump(mode="json")
+    return updated_roles
+
+
 def _is_developer_role(role: dict[str, Any]) -> bool:
     return role.get("name", "").strip().lower() == "developer"
 
@@ -190,7 +231,9 @@ class CosmosPermissionsStore(PermissionsStore):
         return role
 
     def bootstrap_admin_role(self) -> None:
-        _ensure_configured_admin_role(self.list_roles(), self.save_role)
+        roles = _ensure_configured_admin_role(self.list_roles(), self.save_role)
+        roles = _ensure_developer_role(roles, self.save_role)
+        _ensure_configured_developer_role(roles, self.save_role)
 
     def delete_role(self, role_id: str) -> None:
         self.container.delete_item(item=role_id, partition_key=role_id)
@@ -283,7 +326,9 @@ class LocalPermissionsStore(PermissionsStore):
         return role
 
     def bootstrap_admin_role(self) -> None:
-        _ensure_configured_admin_role(self.list_roles(), self.save_role)
+        roles = _ensure_configured_admin_role(self.list_roles(), self.save_role)
+        roles = _ensure_developer_role(roles, self.save_role)
+        _ensure_configured_developer_role(roles, self.save_role)
 
     def delete_role(self, role_id: str) -> None:
         path = self.root / f"role_{role_id}.json"

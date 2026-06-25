@@ -124,6 +124,21 @@ h2 { font-size: 18px; }
 .section-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .search { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
 .action-row { display: flex; flex-wrap: wrap; gap: 10px; }
+.schedule-days {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+.schedule-days button {
+  min-width: 48px;
+  justify-content: center;
+}
+.schedule-days button.selected {
+  border-color: #2563eb;
+  background: #eff6ff;
+  color: #1d4ed8;
+}
 .fabric-split { display: grid; grid-template-columns: 20% 1fr; gap: 14px; align-items: start; }
 .fabric-filters { display: flex; flex-direction: column; gap: 8px; }
 .fabric-filters select, .fabric-filters input, .fabric-filters button { width: 100%; }
@@ -437,6 +452,7 @@ pre {
 .dark-mode .button-link:hover { border-color: #60a5fa; }
 .dark-mode .button-danger { color: #fca5a5; border-color: #7f1d1d; }
 .dark-mode .button-danger:hover { background: #450a0a; border-color: #ef4444; }
+.dark-mode .schedule-days button.selected { background: #1e3a8a; border-color: #60a5fa; color: #dbeafe; }
 .dark-mode label { color: #cbd5e1; }
 .dark-mode .panel,
 .dark-mode .project-card,

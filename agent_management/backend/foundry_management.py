@@ -219,4 +219,8 @@ def _agent_environment() -> dict[str, str]:
     for source, target in aliases.items():
         if os.environ.get(source):
             environment[target] = os.environ[source]
+    if os.environ.get("FABRIC_AGENT_APPINSIGHTS_CONNECTION_STRING"):
+        environment["FABRIC_AGENT_APPINSIGHTS_CONNECTION_STRING"] = os.environ["FABRIC_AGENT_APPINSIGHTS_CONNECTION_STRING"]
+    elif os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING"):
+        environment["FABRIC_AGENT_APPINSIGHTS_CONNECTION_STRING"] = os.environ["APPLICATIONINSIGHTS_CONNECTION_STRING"]
     return environment

@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { InteractionRequiredAuthError } from "@azure/msal-browser";
 import { useMsal } from "@azure/msal-react";
-import { AlertTriangle, Bot, Boxes, CheckCircle2, ExternalLink, FlaskConical, FolderOpen, Loader2, Moon, Plus, RefreshCw, Save, Shield, Sun, Trash2, Wand2, X } from "lucide-react";
+import { AlertTriangle, Bot, Boxes, CalendarClock, CheckCircle2, ExternalLink, FlaskConical, FolderOpen, Loader2, Moon, Plus, RefreshCw, Save, Shield, Sun, Trash2, Wand2, X } from "lucide-react";
 import { fabricTokenRequest, loginRequest, powerBiTokenRequest } from "./authConfig";
 import { AgentRoleBinding, emptyDataSource, emptyModelConfig, emptyRoleMember, ExternalAgentRef, FabricItem, ModelConfig, newProject, newRole, Role, RoleMember, AgentProject, SubagentConfig } from "./types";
 import MemberAutocomplete from "./MemberAutocomplete";
 import DataSourceCombobox from "./DataSourceCombobox";
 
-type ActiveTab = "projects" | "create" | "dev" | "roles";
+type ActiveTab = "projects" | "create" | "dev" | "roles" | "metadata" | "runtime";
 
 type DevTraceStep = {
   step: string;
@@ -17,6 +17,138 @@ type DevTraceStep = {
 };
 
 type DeploymentUiState = "idle" | "working" | "completed" | "failed";
+
+type MetadataRefreshSchedule = {
+  id?: string;
+  name: string;
+  enabled: boolean;
+  cron: string;
+  timezone: string;
+  next_run_at?: string;
+  last_run_at?: string;
+  last_status?: string;
+};
+
+type MetadataRefreshRun = {
+  id: string;
+  trigger?: string;
+  started_at?: string;
+  finished_at?: string;
+  status?: string;
+  semantic_models_found?: number;
+  models_refreshed?: number;
+  models_failed?: number;
+  errors?: unknown[];
+};
+
+type SemanticMetadataSummary = {
+  id: string;
+  semantic_model_name?: string;
+  workspace_name?: string;
+  status?: string;
+  refreshed_at?: string;
+  last_error?: unknown;
+};
+
+type RuntimeVersion = {
+  version: string;
+  digest?: string;
+  is_latest?: boolean;
+  updated_at?: string;
+};
+
+type ProjectVersionSummary = {
+  version: string;
+  foundry_version?: string;
+  project_version?: string;
+  runtime_version?: string;
+  deployed_at: string;
+  deployed_by?: string;
+};
+
+const weekDays = [
+  { value: "1", short: "Mon", label: "Monday" },
+  { value: "2", short: "Tue", label: "Tuesday" },
+  { value: "3", short: "Wed", label: "Wednesday" },
+  { value: "4", short: "Thu", label: "Thursday" },
+  { value: "5", short: "Fri", label: "Friday" },
+  { value: "6", short: "Sat", label: "Saturday" },
+  { value: "0", short: "Sun", label: "Sunday" },
+];
+
+const allWeekDayValues = weekDays.map((day) => day.value);
+
+const timezoneOptions = [
+  "UTC",
+  "America/New_York",
+  "America/Chicago",
+  "America/Denver",
+  "America/Phoenix",
+  "America/Los_Angeles",
+  "America/Anchorage",
+  "Pacific/Honolulu",
+  "Europe/London",
+  "Europe/Paris",
+  "Europe/Berlin",
+  "Asia/Dubai",
+  "Asia/Kolkata",
+  "Asia/Singapore",
+  "Asia/Tokyo",
+  "Australia/Sydney",
+];
+
+function scheduleTimezoneOptions(currentTimezone: string) {
+  return currentTimezone && !timezoneOptions.includes(currentTimezone)
+    ? [currentTimezone, ...timezoneOptions]
+    : timezoneOptions;
+}
+
+function parseScheduleCron(cron: string) {
+  const parts = cron.trim().split(/\s+/);
+  if (parts.length < 5) return { time: "02:00", days: allWeekDayValues };
+  const minute = Number(parts[0]);
+  const hour = Number(parts[1]);
+  const time = Number.isInteger(hour) && Number.isInteger(minute)
+    ? `${String(Math.min(Math.max(hour, 0), 23)).padStart(2, "0")}:${String(Math.min(Math.max(minute, 0), 59)).padStart(2, "0")}`
+    : "02:00";
+  const days = parts[4] === "*"
+    ? allWeekDayValues
+    : parts[4].split(",").map((day) => day.trim()).filter((day) => allWeekDayValues.includes(day));
+  return { time, days: days.length ? days : allWeekDayValues };
+}
+
+function buildScheduleCron(time: string, days: string[]) {
+  const [hour = "2", minute = "0"] = time.split(":");
+  const selectedDays = days.length === allWeekDayValues.length ? "*" : days.join(",");
+  return `${Number(minute) || 0} ${Number(hour) || 0} * * ${selectedDays || "*"}`;
+}
+
+function describeSchedule(schedule: MetadataRefreshSchedule) {
+  const { time, days } = parseScheduleCron(schedule.cron);
+  const [hour, minute] = time.split(":").map(Number);
+  const date = new Date();
+  date.setHours(hour || 0, minute || 0, 0, 0);
+  const timeLabel = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const dayLabel = days.length === allWeekDayValues.length
+    ? "Every day"
+    : weekDays.filter((day) => days.includes(day.value)).map((day) => day.short).join(", ");
+  return `${dayLabel} at ${timeLabel}`;
+}
+
+function metadataRunExecutionType(trigger?: string) {
+  return trigger === "run_now" ? "Run now" : "Schedule";
+}
+
+function metadataRunMessage(run: MetadataRefreshRun) {
+  if (!run.errors?.length) return run.status === "succeeded" ? "Succeeded" : run.status || "Completed";
+  const firstError = run.errors[0] as any;
+  const message = firstError?.error?.[0]?.message?.error?.message
+    || firstError?.error?.message?.error?.message
+    || firstError?.message
+    || firstError?.error
+    || "Metadata refresh failed.";
+  return typeof message === "string" ? message : JSON.stringify(message);
+}
 
 async function readApiResponse(response: Response) {
   const text = await response.text();
@@ -92,36 +224,61 @@ export default function App() {
   const [isLoadingModels, setIsLoadingModels] = useState(false);
   const [isLoadingFoundryModels, setIsLoadingFoundryModels] = useState(false);
   const [roles, setRoles] = useState<Role[]>([]);
+  const [metadataSchedules, setMetadataSchedules] = useState<MetadataRefreshSchedule[]>([]);
+  const [metadataRuns, setMetadataRuns] = useState<MetadataRefreshRun[]>([]);
+  const [semanticMetadata, setSemanticMetadata] = useState<SemanticMetadataSummary[]>([]);
+  const [editingSchedule, setEditingSchedule] = useState<MetadataRefreshSchedule | null>(null);
+  const [isMetadataLoading, setIsMetadataLoading] = useState(false);
   const [editingRole, setEditingRole] = useState<Role | null>(null);
   const [agentBindings, setAgentBindings] = useState<AgentRoleBinding[]>([]);
   const [projectsLoading, setProjectsLoading] = useState(true);
   const [deployedAgents, setDeployedAgents] = useState<ExternalAgentRef[]>([]);
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem("agentManagementTheme") === "dark");
   const [currentUserGroupIds, setCurrentUserGroupIds] = useState<string[]>([]);
-  const [projectVersions, setProjectVersions] = useState<Array<{ version: string; deployed_at: string; deployed_by?: string }>>([]);
+  const [projectVersions, setProjectVersions] = useState<ProjectVersionSummary[]>([]);
   const [selectedVersion, setSelectedVersion] = useState<string | null>(null);
+  const [selectedDeploymentProjectVersion, setSelectedDeploymentProjectVersion] = useState("");
+  const [runtimeVersions, setRuntimeVersions] = useState<RuntimeVersion[]>([]);
+  const [selectedRuntimeVersion, setSelectedRuntimeVersion] = useState("");
+  const [selectedBulkRuntimeVersion, setSelectedBulkRuntimeVersion] = useState("");
+  const [selectedBulkProjectIds, setSelectedBulkProjectIds] = useState<string[]>([]);
+  const [isBulkDeploying, setIsBulkDeploying] = useState(false);
+  const [bulkDeploymentResult, setBulkDeploymentResult] = useState<any>(null);
+  const [runtimeVersionMessage, setRuntimeVersionMessage] = useState("");
   const [viewingVersionSnapshot, setViewingVersionSnapshot] = useState(false);
   const [subagentAddAcknowledged, setSubagentAddAcknowledged] = useState(false);
   const savedProjectSnapshot = useRef<string>(JSON.stringify(newProject()));
   const subagentAddTimeout = useRef<number | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const [conversationId, setConversationId] = useState(() => crypto.randomUUID());
-  const currentUserObjectId = useMemo(() => {
+  const currentUserCandidateIds = useMemo(() => {
     const claims = account?.idTokenClaims as any;
-    return claims?.oid || account?.localAccountId || "";
+    const homeAccountObjectId = account?.homeAccountId?.split(".")[0] || "";
+    return Array.from(new Set([
+      claims?.oid,
+      claims?.objectId,
+      claims?.sub,
+      account?.localAccountId,
+      homeAccountObjectId,
+    ].filter(Boolean).map((id) => String(id))));
   }, [account]);
+  const currentUserObjectId = currentUserCandidateIds[0] || "";
   const hasUnsavedChanges = useMemo(() => JSON.stringify(project) !== savedProjectSnapshot.current, [project]);
   const devProject = useMemo(() => projects.find((candidate) => candidate.id === devProjectId) ?? null, [devProjectId, projects]);
   const projectRoleBinding = useMemo(() => project.id ? agentBindings.find((binding) => binding.project_id === project.id) ?? null : null, [agentBindings, project.id]);
   const rolesForCurrentUser = useMemo(() => {
-    const allowedIds = new Set([currentUserObjectId, ...currentUserGroupIds].filter(Boolean).map((id) => id.toLowerCase()));
+    const allowedIds = new Set([...currentUserCandidateIds, ...currentUserGroupIds].filter(Boolean).map((id) => id.toLowerCase()));
     if (!allowedIds.size) return [];
     return roles.filter((role) => role.members.some((member) => allowedIds.has(member.object_id.toLowerCase())));
-  }, [roles, currentUserObjectId, currentUserGroupIds]);
+  }, [roles, currentUserCandidateIds, currentUserGroupIds]);
   const currentUserRoleIds = useMemo(() => new Set(rolesForCurrentUser.map((role) => role.id).filter(Boolean) as string[]), [rolesForCurrentUser]);
   const isAdmin = useMemo(() => rolesForCurrentUser.some((role) => isAdminRoleName(role.name)), [rolesForCurrentUser]);
   const isDeveloper = useMemo(() => rolesForCurrentUser.some((role) => isDeveloperRoleName(role.name)), [rolesForCurrentUser]);
   const canCreateProjects = isAdmin || isDeveloper;
+  const adminHeaders = useMemo(() => ({
+    "x-user-object-id": currentUserObjectId,
+    "x-user-group-ids": currentUserGroupIds.join(","),
+  }), [currentUserObjectId, currentUserGroupIds]);
   const assignableRoles = useMemo(() => {
     if (isAdmin) return roles;
     return rolesForCurrentUser.filter((role) => !isDeveloperRoleName(role.name));
@@ -133,6 +290,15 @@ export default function App() {
       return binding?.role_ids.some((roleId) => currentUserRoleIds.has(roleId));
     });
   }, [projects, agentBindings, currentUserRoleIds, isAdmin]);
+  const projectVersionOptions = useMemo(() => {
+    const seen = new Set<string>();
+    return projectVersions.filter((item) => {
+      const projectVersion = String(item.project_version || item.version);
+      if (seen.has(projectVersion)) return false;
+      seen.add(projectVersion);
+      return true;
+    });
+  }, [projectVersions]);
   const projectRoles = useCallback((candidate: AgentProject) => {
     const binding = agentBindings.find((item) => item.project_id === candidate.id);
     return (binding?.role_ids ?? [])
@@ -171,7 +337,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!isAdmin && activeTab === "roles") {
+    if (!isAdmin && (activeTab === "roles" || activeTab === "metadata" || activeTab === "runtime")) {
       setActiveTab("projects");
     }
     if (!canCreateProjects && activeTab === "create") {
@@ -181,6 +347,10 @@ export default function App() {
       setActiveTab("projects");
     }
   }, [activeTab, canCreateProjects, isAdmin]);
+
+  useEffect(() => {
+    loadRuntimeVersions();
+  }, []);
 
   useEffect(() => {
     const claims = account?.idTokenClaims as any;
@@ -263,6 +433,7 @@ export default function App() {
       setDevDebug(null);
       setActiveTab("create");
       setSelectedVersion(null);
+      setSelectedDeploymentProjectVersion("");
       setViewingVersionSnapshot(false);
       setStatus(`Opened ${fullProject.name}`);
       // Load version history
@@ -288,6 +459,23 @@ export default function App() {
     }
   };
 
+  const loadRuntimeVersions = async () => {
+    try {
+      setRuntimeVersionMessage("Loading runtime versions...");
+      const response = await fetch("/api/runtime/versions");
+      const data = await readApiResponse(response);
+      const versions = data.versions || [];
+      setRuntimeVersions(versions);
+      const defaultVersion = data.latest_version || versions[0]?.version || "";
+      setSelectedRuntimeVersion((current) => current || defaultVersion);
+      setSelectedBulkRuntimeVersion((current) => current || defaultVersion);
+      setRuntimeVersionMessage(versions.length ? "" : "No ACR runtime versions found");
+    } catch (error: any) {
+      setRuntimeVersions([]);
+      setRuntimeVersionMessage(`Runtime versions unavailable: ${error.message}`);
+    }
+  };
+
   const switchToVersion = async (version: string) => {
     if (!project.id) return;
     try {
@@ -296,14 +484,24 @@ export default function App() {
       const data = await readApiResponse(response);
       if (data.snapshot) {
         const versionProject = { ...newProject(), ...data.snapshot, deployment: cleanDeployment(data.snapshot.deployment) ?? {} };
+        const projectVersion = data.project_version || data.snapshot?.deployment?.info?.project_version || version;
         setProject(versionProject);
         setSelectedVersion(version);
+        setSelectedDeploymentProjectVersion(version);
         setViewingVersionSnapshot(true);
-        setStatus(`Viewing version ${version} (read-only snapshot)`);
+        setStatus(`Viewing project version ${projectVersion}`);
       }
     } catch (error: any) {
       setStatus(`Failed to load version: ${error.message}`);
     }
+  };
+
+  const selectProjectVersion = (version: string) => {
+    if (!version) {
+      switchToLive();
+      return;
+    }
+    switchToVersion(version);
   };
 
   const switchToLive = () => {
@@ -313,6 +511,7 @@ export default function App() {
     if (liveProject) openProject(liveProject);
     else {
       setSelectedVersion(null);
+      setSelectedDeploymentProjectVersion("");
       setViewingVersionSnapshot(false);
     }
   };
@@ -332,7 +531,7 @@ export default function App() {
   const projectDeploymentLabel = (candidate: AgentProject) => {
     if (!projectIsDeployed(candidate)) return "Not deployed";
     const deployment: any = candidate.deployment ?? {};
-    const version = deployment.info?.version || deployment.version || deployment.foundry?.version || deployment.foundry?.name || deployment.foundry?.info?.version;
+    const version = deployment.info?.foundry_version || deployment.info?.version || deployment.foundry_version || deployment.version || deployment.foundry?.version || deployment.foundry?.name || deployment.foundry?.info?.version;
     return version ? `Deployed v${String(version).replace(/^v/i, "")}` : "Deployed";
   };
 
@@ -432,6 +631,59 @@ export default function App() {
     }
   }, []);
 
+  const loadMetadataAdmin = useCallback(async () => {
+    if (!isAdmin) return;
+    setIsMetadataLoading(true);
+    try {
+      const [schedulesResponse, runsResponse, metadataResponse] = await Promise.all([
+        fetch("/api/admin/metadata-refresh/schedules", { headers: adminHeaders }),
+        fetch("/api/admin/metadata-refresh/runs", { headers: adminHeaders }),
+        fetch("/api/admin/semantic-metadata", { headers: adminHeaders }),
+      ]);
+      const schedulesPayload = await readApiResponse(schedulesResponse);
+      const runsPayload = await readApiResponse(runsResponse);
+      const metadataPayload = await readApiResponse(metadataResponse);
+      setMetadataSchedules(schedulesPayload.schedules ?? []);
+      setMetadataRuns(runsPayload.runs ?? []);
+      setSemanticMetadata(metadataPayload.metadata ?? []);
+    } catch (error: any) {
+      setStatus(`Metadata refresh load failed: ${error.message}`);
+    } finally {
+      setIsMetadataLoading(false);
+    }
+  }, [adminHeaders, isAdmin]);
+
+  const saveMetadataSchedule = async (schedule: MetadataRefreshSchedule) => {
+    const method = schedule.id ? "PUT" : "POST";
+    const url = schedule.id ? `/api/admin/metadata-refresh/schedules/${schedule.id}` : "/api/admin/metadata-refresh/schedules";
+    const response = await fetch(url, { method, headers: { "Content-Type": "application/json", ...adminHeaders }, body: JSON.stringify(schedule) });
+    await readApiResponse(response);
+    setEditingSchedule(null);
+    await loadMetadataAdmin();
+    setStatus("Metadata refresh schedule saved.");
+  };
+
+  const deleteMetadataSchedule = async (scheduleId: string) => {
+    const response = await fetch(`/api/admin/metadata-refresh/schedules/${scheduleId}`, { method: "DELETE", headers: adminHeaders });
+    await readApiResponse(response);
+    await loadMetadataAdmin();
+    setStatus("Metadata refresh schedule deleted.");
+  };
+
+  const runMetadataRefreshNow = async () => {
+    setIsMetadataLoading(true);
+    try {
+      const response = await fetch("/api/admin/metadata-refresh/run-now", { method: "POST", headers: adminHeaders });
+      const payload = await readApiResponse(response);
+      await loadMetadataAdmin();
+      setStatus(`Metadata refresh ${payload.status ?? "completed"}: ${payload.models_refreshed ?? 0} refreshed, ${payload.models_failed ?? 0} failed.`);
+    } catch (error: any) {
+      setStatus(`Metadata refresh failed: ${error.message}`);
+    } finally {
+      setIsMetadataLoading(false);
+    }
+  };
+
   const saveRole = async (role: Role) => {
     const method = role.id ? "PUT" : "POST";
     const url = role.id ? `/api/roles/${role.id}` : "/api/roles";
@@ -505,6 +757,12 @@ export default function App() {
     loadProjects();
   }, [loadProjects]);
 
+  useEffect(() => {
+    if (activeTab === "metadata") {
+      loadMetadataAdmin();
+    }
+  }, [activeTab, loadMetadataAdmin]);
+
   const saveProject = async () => {
     try {
       setStatus("Saving project");
@@ -521,8 +779,12 @@ export default function App() {
       setConversationId(crypto.randomUUID());
       setDevChatHistory([]);
       setDeployment(cleanDeployment(saved.deployment));
+      setSelectedVersion(null);
+      setSelectedDeploymentProjectVersion("");
+      setViewingVersionSnapshot(false);
       await loadProjects();
-      setStatus("Project saved");
+      if (saved.id) await loadVersions(saved.id);
+      setStatus("Draft saved");
     } catch (error: any) {
       setStatus(`Save failed: ${error.message}`);
     }
@@ -644,7 +906,12 @@ export default function App() {
       const response = await fetch("/api/deploy/submit-foundry", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project, submit_to_foundry: true }),
+        body: JSON.stringify({
+          project,
+          submit_to_foundry: true,
+          project_version: selectedDeploymentProjectVersion || (viewingVersionSnapshot ? selectedVersion : ""),
+          runtime_version: selectedRuntimeVersion,
+        }),
       });
       const payload = await readApiResponse(response);
       const nextDeployment = payload.build ? {
@@ -676,6 +943,28 @@ export default function App() {
       setStatus(`Foundry deployment failed: ${error.message}`);
     } finally {
       setIsDeploying(false);
+    }
+  };
+
+  const deployBulkRuntime = async () => {
+    if (!selectedBulkRuntimeVersion || selectedBulkProjectIds.length === 0) return;
+    setIsBulkDeploying(true);
+    setBulkDeploymentResult(null);
+    try {
+      const response = await fetch("/api/admin/deploy/runtime", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...adminHeaders },
+        body: JSON.stringify({ project_ids: selectedBulkProjectIds, runtime_version: selectedBulkRuntimeVersion }),
+      });
+      const payload = await readApiResponse(response);
+      setBulkDeploymentResult(payload);
+      await loadProjects();
+      setStatus(`Runtime deployment ${payload.status}: ${payload.succeeded ?? 0} succeeded, ${payload.failed ?? 0} failed.`);
+    } catch (error: any) {
+      setBulkDeploymentResult({ status: "failed", error: error.message, results: [] });
+      setStatus(`Runtime deployment failed: ${error.message}`);
+    } finally {
+      setIsBulkDeploying(false);
     }
   };
 
@@ -732,6 +1021,8 @@ export default function App() {
         <nav>
           <button className={activeTab === "projects" ? "nav-tab active" : "nav-tab"} onClick={() => setActiveTab("projects")}><FolderOpen size={16} /> Projects</button>
           {isAdmin ? <button className={activeTab === "roles" ? "nav-tab active" : "nav-tab"} onClick={() => setActiveTab("roles")}><Shield size={16} /> Roles</button> : null}
+          {isAdmin ? <button className={activeTab === "metadata" ? "nav-tab active" : "nav-tab"} onClick={() => setActiveTab("metadata")}><CalendarClock size={16} /> Metadata</button> : null}
+          {isAdmin ? <button className={activeTab === "runtime" ? "nav-tab active" : "nav-tab"} onClick={() => setActiveTab("runtime")}><ExternalLink size={16} /> Runtime Deploy</button> : null}
           {canCreateProjects ? <button className={activeTab === "dev" ? "nav-tab active" : "nav-tab"} onClick={() => { setDevProjectId(""); setDevChatHistory([]); setDevTrace([]); setDevDebug(null); setDevResponse(""); setConversationId(crypto.randomUUID()); setActiveTab("dev"); }}><FlaskConical size={16} /> Dev UI</button> : null}
         </nav>
         <div className="sidebar-footer">
@@ -780,7 +1071,12 @@ export default function App() {
                   <div className="project-meta"><span>{savedProject.deployment_mode}</span><span>{projectDeploymentLabel(savedProject)}</span></div>
                 </div>
               </div>;
-            }) : <div className="empty-state"><p>No projects available for your roles yet.</p>{canCreateProjects ? <button onClick={createNewProject}><Plus size={16} /> Create your first project</button> : null}</div>}
+            }) : <div className="empty-state">
+              <p>No projects available for your roles yet.</p>
+              {projects.length ? <p className="muted">Loaded {projects.length} project{projects.length === 1 ? "" : "s"}, but your current session matched {rolesForCurrentUser.length} role{rolesForCurrentUser.length === 1 ? "" : "s"}{rolesForCurrentUser.length ? `: ${rolesForCurrentUser.map((role) => role.name).join(", ")}` : "."}</p> : null}
+              {currentUserCandidateIds.length ? <p className="muted">Signed-in ID candidates: {currentUserCandidateIds.join(", ")}</p> : null}
+              {canCreateProjects ? <button onClick={createNewProject}><Plus size={16} /> Create your first project</button> : null}
+            </div>}
           </div>
         </section> : activeTab === "create" ? <>
           <section className="panel" id="designer">
@@ -865,43 +1161,35 @@ export default function App() {
 
           <section className="panel" id="deploy">
             <h2>Deploy to Foundry Hosted Agents</h2>
-            {viewingVersionSnapshot ? (
-              <div className="deployment-state completed" role="status" style={{ marginBottom: 12 }}>
-                <AlertTriangle size={18} />
-                <div>
-                  <strong>Viewing version {selectedVersion} (read-only snapshot)</strong>
-                  <span>Edits are disabled. Switch to "Current Draft" to make changes.</span>
-                </div>
-              </div>
-            ) : null}
             <div className="action-row">
-              <button disabled={isDeploying || viewingVersionSnapshot} onClick={deployToFoundry}>
+              <button disabled={isDeploying || !selectedRuntimeVersion} onClick={deployToFoundry}>
                 {isDeploying ? <Loader2 className="spin" size={16} /> : <ExternalLink size={16} />}
                 {isDeploying ? "Deploying..." : "Deploy to Foundry"}
               </button>
             </div>
-            {/* Version selector */}
-            {projectVersions.length > 0 ? (
-              <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
-                <strong>Version:</strong>
-                <select
-                  value={selectedVersion || ""}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    if (!v) { switchToLive(); }
-                    else { switchToVersion(v); }
-                  }}
-                  style={{ fontSize: 13, padding: "4px 8px" }}
-                >
+            <div className="grid two" style={{ marginTop: 12 }}>
+              <label>Project Version
+                <select value={selectedDeploymentProjectVersion} onChange={(e) => selectProjectVersion(e.target.value)}>
                   <option value="">Current Draft</option>
-                  {projectVersions.map((v) => (
-                    <option key={v.version} value={v.version}>
-                      v{String(v.version).replace(/^v/i, "")} — {v.deployed_at ? new Date(v.deployed_at).toLocaleString() : ""}
+                  {projectVersionOptions.map((v) => (
+                    <option key={`deploy-project-${v.version}`} value={v.version}>
+                      v{String(v.project_version || v.version).replace(/^v/i, "")}
                     </option>
                   ))}
                 </select>
-              </div>
-            ) : null}
+              </label>
+              <label>Runtime Version
+                <select value={selectedRuntimeVersion} onChange={(e) => setSelectedRuntimeVersion(e.target.value)}>
+                  <option value="">Select runtime version</option>
+                  {runtimeVersions.map((v) => (
+                    <option key={`runtime-${v.version}`} value={v.version}>
+                      {v.version}{v.is_latest ? " — current latest" : ""}{v.updated_at ? ` — ${new Date(v.updated_at).toLocaleString()}` : ""}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            {runtimeVersionMessage ? <p className="muted" style={{ marginTop: 8 }}>{runtimeVersionMessage}</p> : null}
             {deploymentUiState !== "idle" ? (
               <div className={`deployment-state ${deploymentUiState}`} role="status" aria-live="polite">
                 {deploymentUiState === "working" ? <Loader2 className="spin" size={18} /> : deploymentUiState === "completed" ? <CheckCircle2 size={18} /> : <AlertTriangle size={18} />}
@@ -916,7 +1204,11 @@ export default function App() {
               const info = deployment?.info || (project.deployment as any)?.info;
               const dep = deployment || project.deployment as any;
               const agentName = info?.agent_name || dep?.agent_name || "—";
-              const version = info?.version || dep?.foundry?.version || dep?.version || "—";
+              const foundryVersion = info?.foundry_version || info?.version || dep?.foundry_version || dep?.foundry?.version || dep?.version || "—";
+              const runtimeImage = info?.runtime_image || dep?.image || "—";
+              const runtimeVersion = info?.runtime_version || dep?.runtime_version || "";
+              const runtimeImageSource = info?.runtime_image_source || dep?.runtime_image_source || "";
+              const projectVersion = info?.project_version || dep?.project_version || "";
               const agentEndpoint = info?.agent_endpoint || dep?.agent_endpoint || dep?.foundry_agent_link || "—";
               const deployedAt = info?.deployed_at || dep?.deployed_at || dep?.foundry?.created_at;
               const foundryLink = info?.foundry_agent_link || dep?.foundry_agent_link || dep?.foundry?.foundry_agent_link;
@@ -925,7 +1217,11 @@ export default function App() {
                   <h3 style={{ margin: "0 0 12px 0", fontSize: 14 }}>Current Deployed Agent Info</h3>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px 24px", fontSize: 13 }}>
                     <div><strong>Agent Name</strong><br />{agentName}</div>
-                    <div><strong>Version</strong><br />{version}</div>
+                    <div><strong>Foundry Version</strong><br />{foundryVersion}</div>
+                    <div><strong>Project Version</strong><br />{projectVersion ? `v${String(projectVersion).replace(/^v/i, "")}` : "—"}</div>
+                    <div><strong>Runtime Version</strong><br />{runtimeVersion || "—"}</div>
+                    <div style={{ gridColumn: "1 / -1" }}><strong>Runtime Image</strong><br /><code style={{ fontSize: 12, wordBreak: "break-all" }}>{runtimeImage}</code></div>
+                    {runtimeImageSource && runtimeImageSource !== runtimeImage ? <div style={{ gridColumn: "1 / -1" }}><strong>Resolved From</strong><br /><code style={{ fontSize: 12, wordBreak: "break-all" }}>{runtimeImageSource}</code></div> : null}
                     <div style={{ gridColumn: "1 / -1" }}><strong>Agent Endpoint</strong><br /><code style={{ fontSize: 12, wordBreak: "break-all" }}>{agentEndpoint}</code></div>
                     <div><strong>Deployed At</strong><br />{deployedAt ? new Date(deployedAt).toLocaleString() : "—"}</div>
                   </div>
@@ -934,7 +1230,144 @@ export default function App() {
               );
             })() : null}
           </section>
-        </> : activeTab === "roles" ? <section className="panel" id="roles">
+        </> : activeTab === "runtime" ? (() => {
+          const deployedProjects = projects.filter(projectIsDeployed);
+          const allSelected = deployedProjects.length > 0 && deployedProjects.every((item) => selectedBulkProjectIds.includes(item.id || ""));
+          const toggleProject = (projectId: string) => setSelectedBulkProjectIds((current) => current.includes(projectId) ? current.filter((item) => item !== projectId) : [...current, projectId]);
+          return <section className="panel" id="runtime-deployments">
+            <div className="section-header">
+              <h2>Runtime Deployments</h2>
+              <div className="action-row">
+                <button disabled={isBulkDeploying || !selectedBulkRuntimeVersion || selectedBulkProjectIds.length === 0} onClick={deployBulkRuntime}>
+                  {isBulkDeploying ? <Loader2 className="spin" size={16} /> : <ExternalLink size={16} />}
+                  {isBulkDeploying ? "Deploying..." : "Deploy selected"}
+                </button>
+                <button disabled={isBulkDeploying} onClick={loadRuntimeVersions}><RefreshCw size={16} /> Refresh versions</button>
+              </div>
+            </div>
+            <div className="grid two">
+              <label>Runtime Version
+                <select value={selectedBulkRuntimeVersion} onChange={(e) => setSelectedBulkRuntimeVersion(e.target.value)}>
+                  <option value="">Select runtime version</option>
+                  {runtimeVersions.map((version) => (
+                    <option key={`bulk-runtime-${version.version}`} value={version.version}>
+                      {version.version}{version.is_latest ? " — current latest" : ""}{version.updated_at ? ` — ${new Date(version.updated_at).toLocaleString()}` : ""}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>Agents
+                <select value={allSelected ? "all" : "custom"} onChange={(e) => setSelectedBulkProjectIds(e.target.value === "all" ? deployedProjects.map((item) => item.id || "").filter(Boolean) : [])}>
+                  <option value="custom">Custom selection ({selectedBulkProjectIds.length})</option>
+                  <option value="all">All deployed agents ({deployedProjects.length})</option>
+                </select>
+              </label>
+            </div>
+            {runtimeVersionMessage ? <p className="muted" style={{ marginTop: 8 }}>{runtimeVersionMessage}</p> : null}
+            <div style={{ marginTop: 16, display: "grid", gap: 8 }}>
+              {deployedProjects.length ? deployedProjects.map((item) => {
+                const dep: any = item.deployment || {};
+                const info = dep.info || {};
+                const projectId = item.id || "";
+                const isSelected = selectedBulkProjectIds.includes(projectId);
+                return <label key={`bulk-project-${projectId}`} style={{ display: "grid", gridTemplateColumns: "auto 1fr auto auto", gap: 12, alignItems: "center", border: "1px solid var(--border)", borderRadius: 8, padding: 12 }}>
+                  <input type="checkbox" checked={isSelected} onChange={() => toggleProject(projectId)} />
+                  <span><strong>{item.name}</strong><br /><span className="muted">{info.agent_name || dep.agent_name || "Deployed agent"}</span></span>
+                  <span><strong>Project</strong><br />{info.project_version ? `v${String(info.project_version).replace(/^v/i, "")}` : "—"}</span>
+                  <span><strong>Runtime</strong><br />{info.runtime_version || dep.runtime_version || "—"}</span>
+                </label>;
+              }) : <p className="muted">No deployed agents found.</p>}
+            </div>
+            {bulkDeploymentResult ? <div className={`deployment-state ${bulkDeploymentResult.status === "succeeded" ? "completed" : bulkDeploymentResult.status === "failed" ? "failed" : "working"}`} role="status" style={{ marginTop: 16 }}>
+              {bulkDeploymentResult.status === "succeeded" ? <CheckCircle2 size={18} /> : <AlertTriangle size={18} />}
+              <div>
+                <strong>Runtime deployment {bulkDeploymentResult.status}</strong>
+                <span>{bulkDeploymentResult.succeeded ?? 0} succeeded, {bulkDeploymentResult.failed ?? 0} failed.</span>
+                {bulkDeploymentResult.results?.length ? <div style={{ marginTop: 8, display: "grid", gap: 4 }}>
+                  {bulkDeploymentResult.results.map((result: any) => <span key={`bulk-result-${result.project_id}`} style={{ fontSize: 12 }}>
+                    {result.project_name || result.project_id}: {result.status}{result.runtime_version ? ` (${result.runtime_version})` : ""}{result.error ? ` — ${result.error}` : ""}
+                  </span>)}
+                </div> : null}
+              </div>
+            </div> : null}
+          </section>;
+        })() : activeTab === "metadata" ? <section className="panel" id="metadata-refresh">
+          <div className="section-header">
+            <h2>Metadata Refresh</h2>
+            <div className="action-row">
+              <button disabled={isMetadataLoading} onClick={loadMetadataAdmin}>{isMetadataLoading ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />} Refresh</button>
+              <button disabled={isMetadataLoading} onClick={runMetadataRefreshNow}><RefreshCw size={16} /> Run now</button>
+              <button onClick={() => setEditingSchedule({ name: "Nightly semantic metadata refresh", enabled: true, cron: "0 2 * * *", timezone: "UTC" })}><Plus size={16} /> New schedule</button>
+            </div>
+          </div>
+
+          {editingSchedule ? <div className="role-editor" style={{ border: "1px solid var(--border)", borderRadius: 8, padding: 16, marginBottom: 16 }}>
+            <h3>{editingSchedule.id ? "Edit Schedule" : "Create Schedule"}</h3>
+            <div className="grid two">
+              <label>Name<input value={editingSchedule.name} onChange={(e) => setEditingSchedule({ ...editingSchedule, name: e.target.value })} /></label>
+              <label>Time<input type="time" value={parseScheduleCron(editingSchedule.cron).time} onChange={(e) => setEditingSchedule({ ...editingSchedule, cron: buildScheduleCron(e.target.value, parseScheduleCron(editingSchedule.cron).days) })} /></label>
+              <label>Timezone<select value={editingSchedule.timezone} onChange={(e) => setEditingSchedule({ ...editingSchedule, timezone: e.target.value })}>{scheduleTimezoneOptions(editingSchedule.timezone).map((timezone) => <option key={timezone} value={timezone}>{timezone}</option>)}</select></label>
+              <label className="toggle-label"><input type="checkbox" checked={editingSchedule.enabled} onChange={(e) => setEditingSchedule({ ...editingSchedule, enabled: e.target.checked })} /> Enabled</label>
+            </div>
+            <div className="schedule-days" aria-label="Refresh days">
+              {weekDays.map((day) => {
+                const schedule = parseScheduleCron(editingSchedule.cron);
+                const selected = schedule.days.includes(day.value);
+                const nextDays = selected ? schedule.days.filter((value) => value !== day.value) : [...schedule.days, day.value];
+                return <button key={day.value} type="button" className={selected ? "selected" : ""} aria-pressed={selected} onClick={() => setEditingSchedule({ ...editingSchedule, cron: buildScheduleCron(schedule.time, nextDays) })}>{day.short}</button>;
+              })}
+            </div>
+            <div className="action-row" style={{ marginTop: 12 }}>
+              <button onClick={() => saveMetadataSchedule(editingSchedule)}><Save size={16} /> Save Schedule</button>
+              <button onClick={() => setEditingSchedule(null)}>Cancel</button>
+            </div>
+          </div> : null}
+
+          <div className="grid two">
+            <div>
+              <h3>Schedules</h3>
+              {metadataSchedules.length ? metadataSchedules.map((schedule) => (
+                <div className="project-card" key={schedule.id} style={{ marginBottom: 12 }}>
+                  <div>
+                    <h3>{schedule.name}</h3>
+                    <p>{schedule.enabled ? "Enabled" : "Disabled"} · {describeSchedule(schedule)} · {schedule.timezone}</p>
+                    <p style={{ fontSize: 12, opacity: 0.7 }}>Next: {schedule.next_run_at ? new Date(schedule.next_run_at).toLocaleString() : "not scheduled"} · Last: {schedule.last_status || "none"}</p>
+                  </div>
+                  <div className="project-actions">
+                    <button onClick={() => setEditingSchedule({ ...schedule })}><FolderOpen size={16} /> Edit</button>
+                    {schedule.id ? <button className="button-danger" onClick={() => deleteMetadataSchedule(schedule.id!)}><Trash2 size={16} /> Delete</button> : null}
+                  </div>
+                </div>
+              )) : <div className="empty-state"><p>No metadata refresh schedules yet.</p></div>}
+            </div>
+            <div>
+              <h3>Cached Semantic Metadata</h3>
+              {semanticMetadata.length ? semanticMetadata.map((item) => (
+                <div className="project-card" key={item.id} style={{ marginBottom: 12 }}>
+                  <div>
+                    <h3>{item.semantic_model_name || item.id}</h3>
+                    <p>{item.workspace_name || "Workspace"} · {item.status || "unknown"}</p>
+                    <p style={{ fontSize: 12, opacity: 0.7 }}>Refreshed: {item.refreshed_at ? new Date(item.refreshed_at).toLocaleString() : "never"}</p>
+                    {item.last_error ? <pre>{JSON.stringify(item.last_error, null, 2)}</pre> : null}
+                  </div>
+                </div>
+              )) : <div className="empty-state"><p>No cached semantic metadata yet.</p></div>}
+            </div>
+          </div>
+
+          <h3 style={{ marginTop: 18 }}>Run History</h3>
+          <div className="role-list">
+            {metadataRuns.length ? metadataRuns.map((run) => (
+              <div className="project-card" key={run.id} style={{ marginBottom: 12 }}>
+                <div>
+                  <h3>{metadataRunExecutionType(run.trigger)}</h3>
+                  <p>{run.started_at ? new Date(run.started_at).toLocaleString() : "Not started"}</p>
+                  <p style={{ fontSize: 12, opacity: 0.7 }}>{metadataRunMessage(run)}</p>
+                </div>
+              </div>
+            )) : <div className="empty-state"><p>No metadata refresh runs yet.</p></div>}
+          </div>
+        </section> : activeTab === "roles" ? <section className="panel" id="roles">
           <div className="section-header"><h2>Roles &amp; Permissions</h2><button onClick={() => setEditingRole(newRole())}><Plus size={16} /> New Role</button></div>
 
           {editingRole ? <div className="role-editor" style={{ border: "1px solid var(--border)", borderRadius: 8, padding: 16, marginBottom: 16 }}>

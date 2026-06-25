@@ -35,6 +35,9 @@ param foundryProjectEndpoint string
 @description('Reusable runtime image used for generated Foundry Hosted Agents.')
 param hostedAgentImage string = '${acrLoginServer}/hosted-agent-runtime:latest'
 
+@description('Cron expression for the metadata refresh poller Container Apps Job. The job reads admin-managed schedules from Cosmos.')
+param metadataRefreshPollerCron string = '*/15 * * * *'
+
 resource logs 'Microsoft.OperationalInsights/workspaces@2025-02-01' = {
   name: '${containerAppName}-logs'
   location: location
@@ -102,6 +105,8 @@ resource app 'Microsoft.App/containerApps@2025-02-02-preview' = {
             { name: 'AGENT_MGMT_PERMISSIONS_DATABASE', value: 'permissions' }
             { name: 'AGENT_MGMT_PERMISSIONS_CONTAINER', value: 'roles' }
             { name: 'AGENT_MGMT_PERMISSIONS_PARTITION_KEY', value: '/roleid' }
+            { name: 'AGENT_MGMT_METADATA_CONTAINER', value: 'semanticmodelmetadata' }
+            { name: 'AGENT_MGMT_METADATA_SCHEDULE_CONTAINER', value: 'metadatarefresh' }
             { name: 'AGENT_MGMT_COSMOS_CREATE_IF_MISSING', value: 'false' }
             { name: 'AGENT_MGMT_COSMOS_AUTH_MODE', value: 'service_principal' }
             { name: 'AZURE_TENANT_ID', value: azureTenantId }
@@ -130,5 +135,65 @@ resource app 'Microsoft.App/containerApps@2025-02-02-preview' = {
   }
 }
 
+resource metadataRefreshJob 'Microsoft.App/jobs@2025-02-02-preview' = {
+  name: '${containerAppName}-metadata-refresh'
+  location: location
+  identity: {
+    type: 'SystemAssigned'
+  }
+  properties: {
+    environmentId: environment.id
+    configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 1800
+      replicaRetryLimit: 1
+      scheduleTriggerConfig: {
+        cronExpression: metadataRefreshPollerCron
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: acrLoginServer
+          identity: 'system'
+        }
+      ]
+      secrets: empty(appClientSecret) ? [] : [
+        {
+          name: 'app-client-secret'
+          value: appClientSecret
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'metadata-refresh'
+          image: image
+          command: ['python', '-m', 'backend.metadata_refresh_worker']
+          env: concat([
+            { name: 'AGENT_MGMT_COSMOS_ENDPOINT', value: agentMgmtCosmosEndpoint }
+            { name: 'AGENT_MGMT_COSMOS_DATABASE', value: 'agents' }
+            { name: 'AGENT_MGMT_COSMOS_CONTAINER', value: 'agentmetadata' }
+            { name: 'AGENT_MGMT_COSMOS_PARTITION_KEY', value: '/projectid' }
+            { name: 'AGENT_MGMT_METADATA_CONTAINER', value: 'semanticmodelmetadata' }
+            { name: 'AGENT_MGMT_METADATA_SCHEDULE_CONTAINER', value: 'metadatarefresh' }
+            { name: 'AGENT_MGMT_COSMOS_AUTH_MODE', value: 'service_principal' }
+            { name: 'AZURE_TENANT_ID', value: azureTenantId }
+            { name: 'APP_CLIENT_ID', value: appClientId }
+          ], empty(appClientSecret) ? [] : [
+            { name: 'APP_CLIENT_SECRET', secretRef: 'app-client-secret' }
+          ])
+          resources: {
+            cpu: json('0.5')
+            memory: '1Gi'
+          }
+        }
+      ]
+    }
+  }
+}
+
 output url string = 'https://${app.properties.configuration.ingress.fqdn}'
 output principalId string = app.identity.principalId
+output metadataRefreshJobPrincipalId string = metadataRefreshJob.identity.principalId

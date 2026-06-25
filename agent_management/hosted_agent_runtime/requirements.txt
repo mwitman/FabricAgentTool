@@ -12,6 +12,7 @@ azure-cosmos>=4.9.0
 azure-identity>=1.19.0
 python-dotenv>=1.0.1
 aiohttp>=3.11.0
+pyarrow>=16.0.0
 
 # Tracing (Azure Monitor / Application Insights)
 azure-monitor-opentelemetry-exporter>=1.0.0b30

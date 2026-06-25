@@ -131,9 +131,16 @@ class DevChatRequest(BaseModel):
 class DeploymentRequest(BaseModel):
     project: AgentProject
     image_tag: str | None = None
+    project_version: str | None = None
+    runtime_version: str | None = None
     agent_name: str | None = None
     build_and_push: bool = False
     submit_to_foundry: bool = False
+
+
+class BulkRuntimeDeploymentRequest(BaseModel):
+    project_ids: list[str]
+    runtime_version: str
 
 
 # ---------------------------------------------------------------------------

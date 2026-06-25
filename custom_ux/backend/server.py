@@ -41,6 +41,22 @@ _custom_ux_dir = _backend_dir.parent
 load_dotenv(_custom_ux_dir / ".env")
 
 # ---------------------------------------------------------------------------
+# Observability / Application Insights
+# ---------------------------------------------------------------------------
+_appinsights_conn = os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING", "")
+try:
+    if _appinsights_conn:
+        import logging as _logging
+        from azure.monitor.opentelemetry import configure_azure_monitor
+
+        configure_azure_monitor(connection_string=_appinsights_conn)
+        _logging.getLogger().setLevel(_logging.INFO)
+except Exception as exc:
+    import logging as _logging
+
+    _logging.getLogger("custom_ux").warning("Application Insights instrumentation unavailable: %s", exc)
+
+# ---------------------------------------------------------------------------
 # Mem0 memory layer (optional — stays in the UX layer for cross-session recall)
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(_backend_dir))
@@ -447,6 +463,56 @@ def _replace_user_conversations(user_id: str, conversations: list[dict[str, Any]
     return sorted((_conversation_response(doc) for doc in sanitized), key=lambda doc: doc.get("updatedAt") or 0, reverse=True)
 
 
+def _upsert_conversation_turn(user_id: str, conversation_id: str, agent: str, user_message: str, assistant_message: str) -> None:
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    container = _history_container()
+    if container is not None:
+        try:
+            doc = container.read_item(item=conversation_id, partition_key=user_id)
+        except Exception:
+            doc = _sanitize_conversation(user_id, {"id": conversation_id, "agent": agent, "name": _conversation_name(user_message)}, conversation_id)
+        messages = _sanitize_messages(doc.get("messages"))
+        messages.extend([
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": assistant_message},
+        ])
+        doc.update({
+            "type": "user_conversation",
+            "userid": user_id,
+            "agent": agent,
+            "messages": messages,
+            "updatedAt": now_ms,
+        })
+        doc[_history_partition_field()] = user_id
+        if not doc.get("name") or doc.get("name") == "New Chat":
+            doc["name"] = _conversation_name(user_message)
+        container.upsert_item(doc)
+        return
+
+    data = _read_local_history()
+    user_docs = data.setdefault(user_id, [])
+    doc = next((item for item in user_docs if item.get("id") == conversation_id), None)
+    if doc is None:
+        doc = _sanitize_conversation(user_id, {"id": conversation_id, "agent": agent, "name": _conversation_name(user_message)}, conversation_id)
+        user_docs.append(doc)
+    messages = _sanitize_messages(doc.get("messages"))
+    messages.extend([
+        {"role": "user", "content": user_message},
+        {"role": "assistant", "content": assistant_message},
+    ])
+    doc.update({"agent": agent, "messages": messages, "updatedAt": now_ms})
+    if not doc.get("name") or doc.get("name") == "New Chat":
+        doc["name"] = _conversation_name(user_message)
+    _write_local_history(data)
+
+
+def _conversation_name(message: str) -> str:
+    text = " ".join(message.strip().split())
+    if not text:
+        return "New Chat"
+    return text[:40] + "..." if len(text) > 40 else text
+
+
 def _delete_user_conversation(user_id: str, conversation_id: str) -> None:
     container = _history_container()
     if container is not None:
@@ -465,6 +531,20 @@ def _delete_user_conversation(user_id: str, conversation_id: str) -> None:
 # App
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Fabric GraphQL Agents - Custom UX")
+
+try:
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+    FastAPIInstrumentor.instrument_app(app)
+except Exception:
+    pass
+
+try:
+    from opentelemetry.instrumentation.aiohttp_client import AioHttpClientInstrumentor
+
+    AioHttpClientInstrumentor().instrument()
+except Exception:
+    pass
 
 app.add_middleware(
     CORSMiddleware,
@@ -662,6 +742,10 @@ async def chat(request: Request):
     if not agent:
         return JSONResponse({"error": "agent is required (pass the agent_name from Cosmos)"}, status_code=400)
 
+    resolved_user = await _resolve_user_from_graph_token(request)
+    if not isinstance(resolved_user, JSONResponse):
+        user_id = resolved_user["id"]
+
     # --- Retrieve conversation and long-term memory context ---
     enriched_message = message
     context_blocks: list[str] = []
@@ -718,7 +802,12 @@ async def chat(request: Request):
                 _mem0_logger.warning("Mem0 add failed: %s", exc)
 
         if full_response:
-            _append_history(user_id, conversation_id, message, "".join(full_response))
+            assistant_message = "".join(full_response)
+            _append_history(user_id, conversation_id, message, assistant_message)
+            try:
+                _upsert_conversation_turn(user_id, conversation_id, agent, message, assistant_message)
+            except Exception as exc:
+                _mem0_logger.warning("Conversation history save failed: %s", exc)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

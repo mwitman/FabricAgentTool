@@ -17,15 +17,16 @@ from fastapi.staticfiles import StaticFiles
 
 from .fabric_semantic import list_fabric_items, list_semantic_models, list_workspaces, semantic_model_metadata
 from .foundry_management import create_hosted_agent_version, foundry_agent_link, get_hosted_agent_info, invoke_hosted_agent
-from .hosted_agent_builder import build_hosted_agent_deployment, validate_project
-from .models import AgentRoleBinding, DeploymentRequest, DevChatRequest, PromptGenerationRequest, AgentProject, Role
+from .hosted_agent_builder import build_hosted_agent_deployment, list_runtime_versions, validate_project
+from .models import AgentRoleBinding, BulkRuntimeDeploymentRequest, DeploymentRequest, DevChatRequest, PromptGenerationRequest, AgentProject, Role
 from .permissions_store import create_permissions_store
 from .project_store import create_project_store, get_version_store
 from .prompt_generator import dev_chat, generate_prompt
+from .semantic_metadata import MetadataScheduleStore, SemanticMetadataStore, refresh_all_project_metadata, refresh_project_metadata
 
 ROOT = Path(__file__).resolve().parent
 APP_ROOT = ROOT.parent
-load_dotenv(APP_ROOT / ".env")
+load_dotenv(APP_ROOT / ".env", override=True)
 load_dotenv(APP_ROOT / "env.TEMPLATE")
 
 app = FastAPI(title="Agent Management")
@@ -119,6 +120,48 @@ def _deployment_error_message(payload: dict[str, Any]) -> str:
     return "; ".join(messages) or "Deployment failed."
 
 
+def _normalize_deployment_timestamp(val):
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        if val < 1e12:
+            return datetime.fromtimestamp(val, tz=timezone.utc).isoformat()
+        return datetime.fromtimestamp(val / 1000, tz=timezone.utc).isoformat()
+    if isinstance(val, str) and val:
+        return val
+    return None
+
+
+def _project_model_deployment(project_dict: dict[str, Any], deployment_mode: str) -> str:
+    if deployment_mode == "standalone":
+        return (project_dict.get("standalone_agent") or {}).get("model_config", {}).get("deployment_name", "")
+    if deployment_mode == "orchestrator_only":
+        return (project_dict.get("orchestrator_only") or {}).get("model_config", {}).get("deployment_name", "")
+    return (project_dict.get("orchestrator") or {}).get("model_config", {}).get("deployment_name", "")
+
+
+def _is_admin_user(user_object_id: str, group_ids: list[str]) -> bool:
+    allowed_ids = {item.strip().lower() for item in [user_object_id, *group_ids] if item.strip()}
+    if not allowed_ids:
+        return False
+    roles = _perms().list_roles()
+    for role in roles:
+        if role.get("name", "").strip().lower() not in {"admin", "admins"}:
+            continue
+        for member in role.get("members", []):
+            if str(member.get("object_id", "")).lower() in allowed_ids:
+                return True
+    return False
+
+
+def _require_admin(request: Request) -> JSONResponse | None:
+    user_object_id = request.headers.get("x-user-object-id", "")
+    group_ids = [item.strip() for item in request.headers.get("x-user-group-ids", "").split(",") if item.strip()]
+    if _is_admin_user(user_object_id, group_ids):
+        return None
+    return JSONResponse({"error": "Admin role is required."}, status_code=403)
+
+
 def json_summary(value: Any) -> str:
     text = str(value)
     return text if len(text) <= 600 else text[:600] + "..."
@@ -126,10 +169,15 @@ def json_summary(value: Any) -> str:
 
 @app.get("/api/health")
 async def health():
+    project_store_type = "uninitialized"
+    if store is not None:
+        project_store_type = type(store).__name__
     return {
         "status": "ok",
         "service": "agent-management",
         "cosmos_endpoint": os.environ.get("AGENT_MGMT_COSMOS_ENDPOINT", ""),
+        "allow_local_store": os.environ.get("AGENT_MGMT_ALLOW_LOCAL_STORE", ""),
+        "project_store_type": project_store_type,
         "foundry_project_endpoint": os.environ.get("FOUNDRY_PROJECT_ENDPOINT", ""),
     }
 
@@ -424,7 +472,7 @@ async def deploy_validate(project: AgentProject):
 
 @app.post("/api/deploy/build")
 async def deploy_build(request: DeploymentRequest):
-    result = build_hosted_agent_deployment(request.project, request.agent_name)
+    result = build_hosted_agent_deployment(request.project, request.agent_name, runtime_version=request.runtime_version or request.image_tag)
     if result.get("valid") and request.project.id:
         project = request.project
         project.deployment = result
@@ -435,23 +483,34 @@ async def deploy_build(request: DeploymentRequest):
 @app.post("/api/deploy/submit-foundry")
 async def deploy_submit_foundry(request: DeploymentRequest):
     try:
-        saved_project = _store().save_project(request.project)
-        build = build_hosted_agent_deployment(saved_project, request.agent_name)
+        selected_project_version = (request.project_version or "").strip()
+        saved_project = _store().get_project(request.project.id) if selected_project_version and request.project.id else _store().save_project(request.project)
+        deploy_project = saved_project
+        if selected_project_version:
+            version_doc = get_version_store().get_version(saved_project.id, selected_project_version)
+            if not version_doc or not version_doc.get("snapshot"):
+                return JSONResponse({"submitted": False, "error": f"Project version {selected_project_version} was not found."}, status_code=400)
+            deploy_project = AgentProject.model_validate({**version_doc["snapshot"], "id": saved_project.id})
+        metadata_refresh = await refresh_project_metadata(deploy_project.model_dump(mode="json", by_alias=True))
+        build = build_hosted_agent_deployment(deploy_project, request.agent_name, runtime_version=request.runtime_version or request.image_tag)
         if not build.get("valid"):
             return JSONResponse({**build, "error": _deployment_error_message(build)}, status_code=400)
         if not request.submit_to_foundry:
-            return {**build, "submitted": False, "message": "Deployment validated. Set submit_to_foundry=true to create the Foundry hosted-agent version."}
+            return {**build, "submitted": False, "metadata_refresh": metadata_refresh, "message": "Deployment validated. Set submit_to_foundry=true to create the Foundry hosted-agent version."}
         # Resolve the model deployment name from the project config
-        project_dict = saved_project.model_dump(mode="json", by_alias=True)
-        if saved_project.deployment_mode == "standalone":
+        project_dict = deploy_project.model_dump(mode="json", by_alias=True)
+        if deploy_project.deployment_mode == "standalone":
             _model_deployment = (project_dict.get("standalone_agent") or {}).get("model_config", {}).get("deployment_name", "")
-        elif saved_project.deployment_mode == "orchestrator_only":
+        elif deploy_project.deployment_mode == "orchestrator_only":
             _model_deployment = (project_dict.get("orchestrator_only") or {}).get("model_config", {}).get("deployment_name", "")
         else:
             _model_deployment = (project_dict.get("orchestrator") or {}).get("model_config", {}).get("deployment_name", "")
         env_vars: dict[str, str] = {"MAF_MGMT_PROJECT_ID": saved_project.id}
         env_vars["MAF_MGMT_VERSIONS_CONTAINER"] = os.environ.get("AGENT_MGMT_VERSIONS_CONTAINER", "agentversions")
+        env_vars["MAF_MGMT_METADATA_CONTAINER"] = os.environ.get("AGENT_MGMT_METADATA_CONTAINER", "semanticmodelmetadata")
         env_vars["MAF_MGMT_AGENT_NAME"] = build["agent_name"]
+        if selected_project_version:
+            env_vars["MAF_MGMT_PROJECT_VERSION"] = selected_project_version
         if _model_deployment:
             env_vars["model_deployment_name"] = _model_deployment
             env_vars["AZURE_OPENAI_DEPLOYMENT_NAME"] = _model_deployment
@@ -465,7 +524,7 @@ async def deploy_submit_foundry(request: DeploymentRequest):
             agent_name=build["agent_name"],
             image=build["image"],
             description=saved_project.description or saved_project.name,
-            metadata={"source": "agent_management", "project_id": saved_project.id, "mode": saved_project.deployment_mode},
+            metadata={"source": "agent_management", "project_id": saved_project.id, "mode": deploy_project.deployment_mode},
             environment_variables=env_vars,
         )
 
@@ -488,18 +547,6 @@ async def deploy_submit_foundry(request: DeploymentRequest):
             or result.get("version_id")
             or agent_info.get("version")
         )
-
-        # --- Save immutable version snapshot to Cosmos using Foundry version number ---
-        if foundry_version:
-            try:
-                get_version_store().save_version(
-                    project_id=saved_project.id,
-                    version=str(foundry_version),
-                    snapshot=project_dict,
-                )
-            except Exception as ver_exc:
-                import logging
-                logging.getLogger(__name__).warning("Failed to save version snapshot: %s", ver_exc)
 
         # Normalize timestamp: Foundry may return Unix seconds, ISO string, or nothing
         def _normalize_timestamp(val):
@@ -528,13 +575,37 @@ async def deploy_submit_foundry(request: DeploymentRequest):
             or _normalize_timestamp(raw_info.get("createdDateTime"))
             or datetime.now(timezone.utc).isoformat()
         )
+        project_version = selected_project_version or foundry_version
         deployment_info = {
             "agent_name": build["agent_name"],
             "agent_endpoint": agent_endpoint_url,
-            "version": foundry_version,
+            "foundry_version": foundry_version,
+            "runtime_image": build.get("image"),
+            "runtime_image_source": build.get("runtime_image_source"),
+            "runtime_version": build.get("runtime_version"),
+            "runtime_latest_digest": build.get("runtime_latest_digest"),
+            "project_version": project_version,
+            "project_version_source": selected_project_version or "current_draft",
             "deployed_at": foundry_deployed_at,
             "foundry_agent_link": result.get("foundry_agent_link") or agent_info.get("foundry_agent_link"),
         }
+        # --- Save immutable version snapshot to Cosmos using Foundry version number ---
+        if foundry_version:
+            try:
+                snapshot_with_deployment = {
+                    **project_dict,
+                    "deployment": {**build, "foundry": result, "info": deployment_info},
+                }
+                get_version_store().save_version(
+                    project_id=saved_project.id,
+                    version=str(foundry_version),
+                    snapshot=snapshot_with_deployment,
+                    project_version=str(project_version or ""),
+                    runtime_version=str(build.get("runtime_version") or ""),
+                )
+            except Exception as ver_exc:
+                import logging
+                logging.getLogger(__name__).warning("Failed to save version snapshot: %s", ver_exc)
         saved_project.deployment = {**build, "foundry": result, "info": deployment_info}
         _store().save_project(saved_project)
         # Ensure an agent role binding exists for the deployed agent
@@ -550,10 +621,233 @@ async def deploy_submit_foundry(request: DeploymentRequest):
             binding.agent_name = build["agent_name"]
             binding.project_display_name = saved_project.name
             _perms().save_agent_binding(binding)
-        return {"submitted": True, "build": build, "foundry": result, "info": deployment_info, "binding_id": binding.id}
+        return {"submitted": True, "build": build, "foundry": result, "info": deployment_info, "binding_id": binding.id, "metadata_refresh": metadata_refresh}
     except Exception as exc:
         import traceback
         traceback.print_exc()
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/runtime/versions")
+async def runtime_versions():
+    try:
+        return list_runtime_versions()
+    except Exception as exc:
+        return JSONResponse({"error": str(exc), "versions": []}, status_code=500)
+
+
+@app.post("/api/admin/deploy/runtime")
+async def admin_deploy_runtime(request: Request, payload: BulkRuntimeDeploymentRequest):
+    admin_error = _require_admin(request)
+    if admin_error:
+        return admin_error
+
+    runtime_version = payload.runtime_version.strip()
+    if not runtime_version or runtime_version == "latest":
+        return JSONResponse({"error": "Select a concrete runtime version tag, not latest."}, status_code=400)
+
+    results: list[dict[str, Any]] = []
+    for project_id in payload.project_ids:
+        item: dict[str, Any] = {"project_id": project_id, "status": "failed"}
+        try:
+            saved_project = _store().get_project(project_id)
+            item["project_name"] = saved_project.name
+            deployment = saved_project.deployment or {}
+            info = deployment.get("info") or {}
+            foundry = deployment.get("foundry") or {}
+            agent_name = info.get("agent_name") or deployment.get("agent_name")
+            pinned_project_version = str(
+                info.get("project_version")
+                or deployment.get("project_version")
+                or ""
+            ).strip()
+            if not agent_name:
+                raise RuntimeError("Project does not have a deployed agent name.")
+            deploy_project = saved_project
+            project_version_source = "current_draft"
+            if pinned_project_version:
+                version_doc = get_version_store().get_version(saved_project.id, pinned_project_version)
+                if version_doc and version_doc.get("snapshot"):
+                    deploy_project = AgentProject.model_validate({**version_doc["snapshot"], "id": saved_project.id})
+                    project_version_source = pinned_project_version
+            project_dict = deploy_project.model_dump(mode="json", by_alias=True)
+            build = build_hosted_agent_deployment(deploy_project, agent_name, runtime_version=runtime_version)
+            if not build.get("valid"):
+                raise RuntimeError(_deployment_error_message(build))
+
+            model_deployment = _project_model_deployment(project_dict, deploy_project.deployment_mode)
+            env_vars: dict[str, str] = {
+                "MAF_MGMT_PROJECT_ID": saved_project.id,
+                "MAF_MGMT_VERSIONS_CONTAINER": os.environ.get("AGENT_MGMT_VERSIONS_CONTAINER", "agentversions"),
+                "MAF_MGMT_METADATA_CONTAINER": os.environ.get("AGENT_MGMT_METADATA_CONTAINER", "semanticmodelmetadata"),
+                "MAF_MGMT_AGENT_NAME": build["agent_name"],
+                "project_deployed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if pinned_project_version and project_version_source != "current_draft":
+                env_vars["MAF_MGMT_PROJECT_VERSION"] = pinned_project_version
+            if model_deployment:
+                env_vars["model_deployment_name"] = model_deployment
+                env_vars["AZURE_OPENAI_DEPLOYMENT_NAME"] = model_deployment
+            elif os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME"):
+                env_vars["model_deployment_name"] = os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"]
+                env_vars["AZURE_OPENAI_DEPLOYMENT_NAME"] = os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"]
+
+            foundry_result = await create_hosted_agent_version(
+                agent_name=build["agent_name"],
+                image=build["image"],
+                description=saved_project.description or saved_project.name,
+                metadata={"source": "agent_management", "project_id": saved_project.id, "mode": deploy_project.deployment_mode, "bulk_runtime_deploy": "true"},
+                environment_variables=env_vars,
+            )
+            if foundry_result.get("errors"):
+                raise RuntimeError(_deployment_error_message(foundry_result))
+
+            agent_info = await get_hosted_agent_info(build["agent_name"])
+            foundry_endpoint = os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "").rstrip("/")
+            agent_endpoint_url = f"{foundry_endpoint}/agents/{build['agent_name']}/endpoint/protocols/openai/responses"
+            foundry_version = foundry_result.get("version") or foundry_result.get("name") or foundry_result.get("version_id") or agent_info.get("version")
+            project_version = pinned_project_version if project_version_source != "current_draft" else str(foundry_version or "")
+            raw_info = agent_info.get("raw") or {}
+            foundry_deployed_at = (
+                _normalize_deployment_timestamp(foundry_result.get("created_date_time"))
+                or _normalize_deployment_timestamp(foundry_result.get("createdDateTime"))
+                or _normalize_deployment_timestamp(foundry_result.get("created_at"))
+                or _normalize_deployment_timestamp(foundry_result.get("lastModifiedDateTime"))
+                or _normalize_deployment_timestamp(foundry_result.get("last_modified_date_time"))
+                or _normalize_deployment_timestamp(raw_info.get("last_modified_date_time"))
+                or _normalize_deployment_timestamp(raw_info.get("lastModifiedDateTime"))
+                or _normalize_deployment_timestamp(raw_info.get("created_date_time"))
+                or _normalize_deployment_timestamp(raw_info.get("createdDateTime"))
+                or datetime.now(timezone.utc).isoformat()
+            )
+            deployment_info = {
+                "agent_name": build["agent_name"],
+                "agent_endpoint": agent_endpoint_url,
+                "foundry_version": foundry_version,
+                "runtime_image": build.get("image"),
+                "runtime_image_source": build.get("runtime_image_source"),
+                "runtime_version": build.get("runtime_version"),
+                "runtime_latest_digest": build.get("runtime_latest_digest"),
+                "project_version": project_version,
+                "project_version_source": project_version_source,
+                "deployed_at": foundry_deployed_at,
+                "foundry_agent_link": foundry_result.get("foundry_agent_link") or agent_info.get("foundry_agent_link"),
+            }
+            if foundry_version:
+                snapshot_with_deployment = {
+                    **project_dict,
+                    "deployment": {**build, "foundry": foundry_result, "info": deployment_info},
+                }
+                get_version_store().save_version(
+                    project_id=saved_project.id,
+                    version=str(foundry_version),
+                    snapshot=snapshot_with_deployment,
+                    project_version=project_version,
+                    runtime_version=str(build.get("runtime_version") or ""),
+                )
+            saved_project.deployment = {**build, "foundry": foundry_result, "info": deployment_info}
+            _store().save_project(saved_project)
+            item.update({
+                "status": "succeeded",
+                "agent_name": build["agent_name"],
+                "foundry_version": foundry_version,
+                "project_version": project_version,
+                "project_version_source": project_version_source,
+                "runtime_version": build.get("runtime_version"),
+                "runtime_image": build.get("image"),
+            })
+        except Exception as exc:
+            item["error"] = str(exc)
+        results.append(item)
+
+    succeeded = sum(1 for item in results if item.get("status") == "succeeded")
+    failed = len(results) - succeeded
+    return {"status": "succeeded" if failed == 0 else "partial" if succeeded else "failed", "succeeded": succeeded, "failed": failed, "results": results}
+
+
+# ---------------------------------------------------------------------------
+# Semantic Metadata Cache / Refresh API
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/admin/semantic-metadata")
+async def list_semantic_metadata(request: Request):
+    denied = _require_admin(request)
+    if denied:
+        return denied
+    try:
+        return {"metadata": await run_in_threadpool(lambda: SemanticMetadataStore().list_metadata())}
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/admin/metadata-refresh/schedules")
+async def list_metadata_refresh_schedules(request: Request):
+    denied = _require_admin(request)
+    if denied:
+        return denied
+    try:
+        return {"schedules": await run_in_threadpool(lambda: MetadataScheduleStore().list_schedules())}
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/admin/metadata-refresh/schedules")
+async def create_metadata_refresh_schedule(request: Request):
+    denied = _require_admin(request)
+    if denied:
+        return denied
+    payload = await request.json()
+    try:
+        return await run_in_threadpool(lambda: MetadataScheduleStore().upsert_schedule(payload))
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.put("/api/admin/metadata-refresh/schedules/{schedule_id}")
+async def update_metadata_refresh_schedule(schedule_id: str, request: Request):
+    denied = _require_admin(request)
+    if denied:
+        return denied
+    payload = await request.json()
+    payload["id"] = schedule_id
+    try:
+        return await run_in_threadpool(lambda: MetadataScheduleStore().upsert_schedule(payload))
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.delete("/api/admin/metadata-refresh/schedules/{schedule_id}")
+async def delete_metadata_refresh_schedule(schedule_id: str, request: Request):
+    denied = _require_admin(request)
+    if denied:
+        return denied
+    try:
+        await run_in_threadpool(lambda: MetadataScheduleStore().delete_schedule(schedule_id))
+        return {"status": "deleted", "schedule_id": schedule_id}
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/admin/metadata-refresh/run-now")
+async def run_metadata_refresh_now(request: Request):
+    denied = _require_admin(request)
+    if denied:
+        return denied
+    try:
+        return await refresh_all_project_metadata(trigger="run_now")
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/admin/metadata-refresh/runs")
+async def list_metadata_refresh_runs(request: Request, limit: int = 50):
+    denied = _require_admin(request)
+    if denied:
+        return denied
+    try:
+        return {"runs": await run_in_threadpool(lambda: MetadataScheduleStore().list_runs(limit))}
+    except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 

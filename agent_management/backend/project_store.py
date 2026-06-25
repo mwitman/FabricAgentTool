@@ -155,7 +155,15 @@ class VersionStore:
         self.database = client.get_database_client(database_name)
         self.container = self.database.get_container_client(container_name)
 
-    def save_version(self, project_id: str, version: str, snapshot: dict[str, Any], deployed_by: str = "") -> dict[str, Any]:
+    def save_version(
+        self,
+        project_id: str,
+        version: str,
+        snapshot: dict[str, Any],
+        deployed_by: str = "",
+        project_version: str = "",
+        runtime_version: str = "",
+    ) -> dict[str, Any]:
         """Write an immutable version snapshot (secrets stripped)."""
         from datetime import datetime, timezone
         import copy
@@ -165,6 +173,9 @@ class VersionStore:
             "id": f"{project_id}:{version}",
             "projectid": project_id,
             "version": version,
+            "foundry_version": version,
+            "project_version": project_version or version,
+            "runtime_version": runtime_version,
             "snapshot": clean_snapshot,
             "deployed_at": datetime.now(timezone.utc).isoformat(),
             "deployed_by": deployed_by,
@@ -181,7 +192,7 @@ class VersionStore:
 
     def list_versions(self, project_id: str) -> list[dict[str, Any]]:
         """List all versions for a project, newest first."""
-        query = "SELECT c.id, c.version, c.deployed_at, c.deployed_by FROM c WHERE c.projectid = @pid ORDER BY c.deployed_at DESC"
+        query = "SELECT c.id, c.version, c.foundry_version, c.project_version, c.runtime_version, c.deployed_at, c.deployed_by FROM c WHERE c.projectid = @pid ORDER BY c.deployed_at DESC"
         params = [{"name": "@pid", "value": project_id}]
         return list(self.container.query_items(query=query, parameters=params, partition_key=project_id))
 

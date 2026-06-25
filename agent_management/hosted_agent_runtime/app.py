@@ -22,6 +22,7 @@ from urllib.parse import urljoin
 import aiohttp
 import uvicorn
 from azure.cosmos import CosmosClient
+from azure.cosmos.exceptions import CosmosResourceNotFoundError
 from azure.identity import ClientSecretCredential, DefaultAzureCredential
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -53,6 +54,11 @@ except ImportError:
     except ImportError:
         TextContent = None  # type: ignore[assignment,misc]
 
+try:
+    import pyarrow.ipc as arrow_ipc
+except ImportError:
+    arrow_ipc = None  # type: ignore[assignment]
+
 # FoundryChatClient — may live in different submodules
 try:
     from agent_framework.foundry import FoundryChatClient
@@ -62,7 +68,7 @@ except ImportError:
 load_dotenv()
 
 # ── Observability / Tracing ───────────────────────────────────────────────────
-_appinsights_conn = os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING", "")
+_appinsights_conn = os.environ.get("FABRIC_AGENT_APPINSIGHTS_CONNECTION_STRING") or os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING", "")
 try:
     from agent_framework.observability import OBSERVABILITY_SETTINGS
 
@@ -176,15 +182,19 @@ def _project() -> dict[str, Any]:
         raise RuntimeError("MAF_MGMT_COSMOS_ENDPOINT is required.")
     database_name = os.environ.get("MAF_MGMT_COSMOS_DATABASE") or os.environ.get("AGENT_MGMT_COSMOS_DATABASE", "agents")
     versions_container = os.environ.get("MAF_MGMT_VERSIONS_CONTAINER") or os.environ.get("AGENT_MGMT_VERSIONS_CONTAINER", "agentversions")
+    project_version = (os.environ.get("MAF_MGMT_PROJECT_VERSION") or os.environ.get("AGENT_MGMT_PROJECT_VERSION", "")).strip()
     client = CosmosClient(endpoint, credential=_credential())
     db = client.get_database_client(database_name)
 
-    # Load the latest version snapshot from agentversions
+    # Load the pinned version snapshot when one was selected at deployment time; otherwise use newest.
     try:
         container = db.get_container_client(versions_container)
-        query = "SELECT TOP 1 * FROM c WHERE c.projectid = @pid ORDER BY c.deployed_at DESC"
-        params = [{"name": "@pid", "value": project_id}]
-        results = list(container.query_items(query=query, parameters=params, partition_key=project_id, max_item_count=1))
+        if project_version:
+            results = [container.read_item(item=f"{project_id}:{project_version}", partition_key=project_id)]
+        else:
+            query = "SELECT TOP 1 * FROM c WHERE c.projectid = @pid ORDER BY c.deployed_at DESC"
+            params = [{"name": "@pid", "value": project_id}]
+            results = list(container.query_items(query=query, parameters=params, partition_key=project_id, max_item_count=1))
         if results and results[0].get("snapshot"):
             logger.info("_project: loaded snapshot version %s from %s", results[0].get("version"), versions_container)
             _project_cache = results[0]["snapshot"]
@@ -199,6 +209,43 @@ def _project() -> dict[str, Any]:
     logger.warning("_project: falling back to live read from %s", container_name)
     container = db.get_container_client(container_name)
     return container.read_item(item=project_id, partition_key=project_id)
+
+
+def _cosmos_db():
+    endpoint = (os.environ.get("MAF_MGMT_COSMOS_ENDPOINT") or os.environ.get("AGENT_MGMT_COSMOS_ENDPOINT", "")).strip()
+    if not endpoint:
+        raise RuntimeError("MAF_MGMT_COSMOS_ENDPOINT is required.")
+    database_name = os.environ.get("MAF_MGMT_COSMOS_DATABASE") or os.environ.get("AGENT_MGMT_COSMOS_DATABASE", "agents")
+    client = CosmosClient(endpoint, credential=_credential())
+    return client.get_database_client(database_name)
+
+
+def _semantic_metadata_from_cache(workspace_id: str, semantic_model_id: str) -> dict[str, Any] | None:
+    container_name = os.environ.get("MAF_MGMT_METADATA_CONTAINER") or os.environ.get("AGENT_MGMT_METADATA_CONTAINER", "semanticmodelmetadata")
+    item_id = f"{workspace_id}:{semantic_model_id}"
+    logger = logging.getLogger("hosted_agent_runtime.metadata")
+    try:
+        doc = _cosmos_db().get_container_client(container_name).read_item(item=item_id, partition_key=item_id)
+    except CosmosResourceNotFoundError:
+        logger.info("Semantic metadata cache miss: container=%s semantic_model_id=%s", container_name, semantic_model_id)
+        return None
+    except Exception as exc:
+        logger.warning("Semantic metadata cache read failed: container=%s semantic_model_id=%s error=%s", container_name, semantic_model_id, exc)
+        return None
+    logger.info("Semantic metadata cache hit: container=%s semantic_model_id=%s refreshed_at=%s", container_name, semantic_model_id, doc.get("refreshed_at"))
+    return {
+        "workspace_id": workspace_id,
+        "semantic_model_id": semantic_model_id,
+        "semantic_model_name": doc.get("semantic_model_name"),
+        "tables": doc.get("tables") or {"value": []},
+        "relationships": doc.get("relationships") or [],
+        "ai_instructions": doc.get("ai_instructions") or "",
+        "metadata_source": "cosmos_cache",
+        "definition_hash": doc.get("definition_hash"),
+        "refreshed_at": doc.get("refreshed_at"),
+        "status": doc.get("status"),
+        "last_error": doc.get("last_error"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -931,6 +978,9 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
     async def get_semantic_model_metadata(workspace_id: str, semantic_model_id: str) -> str:
         if not _can_query_semantic_model(workspace_id, semantic_model_id):
             return json.dumps({"error": "That semantic model is not configured for this agent project."})
+        cached_metadata = _semantic_metadata_from_cache(workspace_id, semantic_model_id)
+        if cached_metadata and cached_metadata.get("tables", {}).get("value"):
+            return json.dumps(cached_metadata, indent=2)
         dataset_url = f"{POWERBI_API}/groups/{workspace_id}/datasets/{semantic_model_id}"
         async with aiohttp.ClientSession() as session:
             # Primary: DAX INFO queries (requires only Build permission, no special item permissions)
@@ -985,25 +1035,43 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
             return json.dumps({"errors": [{"message": "That semantic model is not configured for this agent project."}]})
         if not _is_readonly_dax(dax_query):
             return json.dumps({"errors": [{"message": "Only read-only DAX queries starting with EVALUATE are allowed."}]})
-        dataset_url = f"{POWERBI_API}/groups/{workspace_id}/datasets/{semantic_model_id}"
-        body = {"queries": [{"query": dax_query}], "serializerSettings": {"includeNulls": True}}
-        async with aiohttp.ClientSession() as session:
-            async with session.post(f"{dataset_url}/executeQueries", headers=_powerbi_headers(effective_powerbi_token), json=body) as response:
-                text = await response.text()
-                try:
-                    payload = json.loads(text) if text else {}
-                except json.JSONDecodeError:
-                    payload = {"raw": text}
-                if response.status >= 400:
-                    return json.dumps({"errors": [{"status": response.status, "message": payload}]})
-                rows = _query_rows(payload)
-                return json.dumps({"query": dax_query, "row_count": len(rows), "rows": rows[:50]}, indent=2)
+        result = await _execute_dax_user_query(effective_powerbi_token, workspace_id, semantic_model_id, dax_query)
+        return json.dumps(result, indent=2)
+
+    @ai_function(
+        name="execute_dax_queries",
+        description=(
+            "Execute multiple guarded read-only DAX result sets in one semantic-model query operation when possible. "
+            "Pass dax_queries_json as an array of {name, query}. Use this for comparisons."
+        ),
+    )
+    async def execute_dax_queries(workspace_id: str, semantic_model_id: str, dax_queries_json: str) -> str:
+        if not _can_query_semantic_model(workspace_id, semantic_model_id):
+            return json.dumps({"errors": [{"message": "That semantic model is not configured for this agent project."}]})
+        try:
+            queries = json.loads(dax_queries_json)
+        except json.JSONDecodeError as exc:
+            return json.dumps({"errors": [{"message": f"dax_queries_json must be valid JSON: {exc}"}]})
+        if not isinstance(queries, list) or not queries:
+            return json.dumps({"errors": [{"message": "dax_queries_json must be a non-empty array."}]})
+        if len(queries) > int(os.environ.get("POWERBI_DAX_MAX_RESULTSETS", "5")):
+            return json.dumps({"errors": [{"message": "Too many DAX result sets requested."}]})
+        normalized_queries = []
+        for index, item in enumerate(queries):
+            if not isinstance(item, dict):
+                return json.dumps({"errors": [{"message": "Each DAX query item must be an object."}]})
+            query = str(item.get("query") or "")
+            if not _is_readonly_dax(query):
+                return json.dumps({"errors": [{"message": f"Query {index + 1} is not an allowed read-only DAX query."}]})
+            normalized_queries.append({"name": str(item.get("name") or f"result_{index + 1}"), "query": query})
+        result = await _execute_dax_user_queries(effective_powerbi_token, workspace_id, semantic_model_id, normalized_queries)
+        return json.dumps(result, indent=2)
 
     tools = [list_configured_fabric_data_sources]
     if allow_dynamic_fabric_items:
         tools.append(discover_accessible_fabric_items)
     if has_semantic_model_access:
-        tools.extend([list_configured_semantic_models, get_semantic_model_metadata, execute_dax_query])
+        tools.extend([list_configured_semantic_models, get_semantic_model_metadata, execute_dax_query, execute_dax_queries])
     if graphql_sources or allow_dynamic_fabric_items:
         tools.extend([query_fabric_graphql, get_fabric_item_definition])
     elif data_sources:
@@ -1094,7 +1162,7 @@ async def _run_agent(project: dict[str, Any], message: str, fabric_token: str, c
     import logging
     logger = logging.getLogger("hosted_agent_runtime")
     try:
-        agent = _create_agent(project, fabric_token, powerbi_token)
+        agent = _create_agent(project, fabric_token, powerbi_token, tool_wrapper=_make_tool_trace_wrapper(conversation_id))
         logger.info("Agent created: mode=%s, tools=%d", project.get("deployment_mode"), len(getattr(agent, "tools", []) or []))
     except Exception as exc:
         logger.exception("Failed to create agent")
@@ -1223,7 +1291,7 @@ async def _run_agent_sse(project: dict[str, Any], message: str, fabric_token: st
     yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': {'id': response_id, 'status': 'in_progress'}})}\n\n"
 
     try:
-        agent = _create_agent(project, fabric_token, powerbi_token)
+        agent = _create_agent(project, fabric_token, powerbi_token, tool_wrapper=_make_tool_trace_wrapper(conversation_id))
         logger.info("Agent created for stream: mode=%s, tools=%d", project.get("deployment_mode"), len(getattr(agent, "tools", []) or []))
     except Exception as exc:
         logger.exception("Failed to create streaming agent")
@@ -1266,6 +1334,70 @@ async def _run_agent_sse(project: dict[str, Any], message: str, fabric_token: st
         yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'delta': error_text})}\n\n"
         yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': {'id': response_id, 'status': 'completed'}})}\n\n"
         yield "data: [DONE]\n\n"
+
+
+def _tool_arguments(kwargs: dict[str, Any]) -> dict[str, Any]:
+    tool_args = kwargs.get("arguments")
+    if hasattr(tool_args, "model_dump"):
+        tool_args = tool_args.model_dump()
+    elif hasattr(tool_args, "dict"):
+        tool_args = tool_args.dict()
+    elif not isinstance(tool_args, dict):
+        tool_args = dict(tool_args) if tool_args else {}
+    return {key: value for key, value in tool_args.items() if "token" not in key.lower() and "authorization" not in key.lower()}
+
+
+def _tool_result_preview(result: Any, limit: int = 1000) -> str:
+    if isinstance(result, list):
+        texts = [getattr(item, "text", None) for item in result if getattr(item, "text", None)]
+        result_str = "\n".join(texts) if texts else str(result)
+    else:
+        result_str = str(result) if result is not None else ""
+    return result_str[:limit] + "..." if len(result_str) > limit else result_str
+
+
+def _make_tool_trace_wrapper(conversation_id: str):
+    logger = logging.getLogger("hosted_agent_runtime.traces")
+
+    def _wrap(tool_obj: Any):
+        tool_name = getattr(tool_obj, "name", None) or "unknown"
+        original_invoke = tool_obj.invoke
+
+        async def _traced_invoke(*args, **kwargs):
+            tool_args = _tool_arguments(kwargs)
+            start = time.time()
+            logger.info(
+                "LLM tool call started: conversation_id=%s tool=%s args=%s",
+                conversation_id,
+                tool_name,
+                json.dumps(tool_args, default=str)[:1000],
+            )
+            try:
+                result = await original_invoke(*args, **kwargs)
+                elapsed_ms = round((time.time() - start) * 1000)
+                logger.info(
+                    "LLM tool call completed: conversation_id=%s tool=%s status=success elapsed_ms=%s result_preview=%s",
+                    conversation_id,
+                    tool_name,
+                    elapsed_ms,
+                    _tool_result_preview(result),
+                )
+                return result
+            except Exception as exc:
+                elapsed_ms = round((time.time() - start) * 1000)
+                logger.exception(
+                    "LLM tool call failed: conversation_id=%s tool=%s status=error elapsed_ms=%s error=%s",
+                    conversation_id,
+                    tool_name,
+                    elapsed_ms,
+                    exc,
+                )
+                raise
+
+        tool_obj.invoke = _traced_invoke
+        return tool_obj
+
+    return _wrap
 
 
 def _agent_response_text(response: Any) -> str:
@@ -1609,6 +1741,64 @@ async def _execute_dax(session: aiohttp.ClientSession, dataset_url: str, powerbi
         if response.status >= 400:
             return {"errors": [{"status": response.status, "url": f"{dataset_url}/executeQueries", "message": payload, "query": query}]}
         return payload
+
+
+async def _execute_dax_user_query(powerbi_token: str, workspace_id: str, semantic_model_id: str, dax_query: str) -> dict[str, Any]:
+    result = await _execute_dax_user_queries(powerbi_token, workspace_id, semantic_model_id, [{"name": "result", "query": dax_query}])
+    if result.get("errors"):
+        return result
+    result_set = (result.get("result_sets") or [{}])[0]
+    return {"query": dax_query, "endpoint": result.get("endpoint"), "row_count": result_set.get("row_count", 0), "rows": result_set.get("rows", [])}
+
+
+async def _execute_dax_user_queries(powerbi_token: str, workspace_id: str, semantic_model_id: str, dax_queries: list[dict[str, str]]) -> dict[str, Any]:
+    use_arrow = os.environ.get("POWERBI_DAX_EXECUTION_MODE", "arrow").lower() == "arrow"
+    if use_arrow and arrow_ipc is not None:
+        arrow_result = await _execute_dax_arrow(powerbi_token, workspace_id, semantic_model_id, dax_queries)
+        if not arrow_result.get("errors") or os.environ.get("POWERBI_DAX_ARROW_FALLBACK_JSON", "true").lower() != "true":
+            return arrow_result
+    result_sets = []
+    dataset_url = f"{POWERBI_API}/groups/{workspace_id}/datasets/{semantic_model_id}"
+    async with aiohttp.ClientSession() as session:
+        for item in dax_queries:
+            payload = await _execute_dax(session, dataset_url, powerbi_token, item["query"])
+            if payload.get("errors"):
+                return {"endpoint": "executeQueries", "errors": payload["errors"], "result_sets": result_sets}
+            rows = _query_rows(payload)
+            result_sets.append({"name": item["name"], "query": item["query"], "row_count": len(rows), "rows": rows[:_max_dax_rows()]})
+    return {"endpoint": "executeQueries", "result_sets": result_sets}
+
+
+async def _execute_dax_arrow(powerbi_token: str, workspace_id: str, semantic_model_id: str, dax_queries: list[dict[str, str]]) -> dict[str, Any]:
+    dax_script = "\n\n".join(item["query"].strip() for item in dax_queries)
+    url = f"{POWERBI_API}/groups/{workspace_id}/datasets/{semantic_model_id}/executeDaxQueries"
+    body = {"query": dax_script}
+    headers = {**_powerbi_headers(powerbi_token), "Accept": "application/vnd.apache.arrow.stream"}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=body) as response:
+            content = await response.read()
+            if response.status >= 400:
+                try:
+                    message = json.loads(content.decode("utf-8")) if content else {}
+                except Exception:
+                    message = {"raw": content[:1000].decode("utf-8", errors="ignore")}
+                return {"endpoint": "executeDaxQueries", "errors": [{"status": response.status, "message": message}]}
+    try:
+        reader = arrow_ipc.open_stream(content)  # type: ignore[union-attr]
+        result_sets = []
+        for index, batch in enumerate(reader):
+            table = batch.to_pydict()
+            column_names = list(table.keys())
+            rows = [dict(zip(column_names, values)) for values in zip(*table.values())]
+            query = dax_queries[min(index, len(dax_queries) - 1)]
+            result_sets.append({"name": query["name"], "query": query["query"], "row_count": len(rows), "rows": rows[:_max_dax_rows()]})
+        return {"endpoint": "executeDaxQueries", "result_sets": result_sets}
+    except Exception as exc:
+        return {"endpoint": "executeDaxQueries", "errors": [{"message": f"Failed to decode Arrow response: {exc}"}]}
+
+
+def _max_dax_rows() -> int:
+    return max(1, min(int(os.environ.get("POWERBI_DAX_MAX_ROWS_PER_RESULT", "50")), 500))
 
 
 def _decode_definition_payload(part: dict[str, Any]) -> str:

@@ -23,6 +23,8 @@ Authenticates with `APP_CLIENT_ID`/`APP_CLIENT_SECRET` when provided, otherwise 
 
 Projects are stored in the `agents` database, `agentmetadata` container, using `/projectid` as the partition key. Roles and agent role bindings are stored in the `permissions` database, `roles` container, using `/roleid` as the partition key. The databases/containers are not created automatically by default.
 
+Set `AGENT_MGMT_BOOTSTRAP_ADMIN_OBJECT_IDS` and `AGENT_MGMT_BOOTSTRAP_DEVELOPER_OBJECT_IDS` in `.env` to comma- or semicolon-separated Entra user/group object IDs to seed the Admin and Developer roles at startup.
+
 ## Local Development
 
 ```powershell
@@ -51,13 +53,14 @@ docker push <your-acr>.azurecr.io/agent-management:latest
 
 Deploys Foundry Hosted Agents by saving the project to Azure Cosmos DB and submitting a reusable runtime image with `AGENT_MGMT_PROJECT_ID`. Users do not need to generate a local package for each project.
 
-Build and push the runtime image once, then keep `HOSTED_AGENT_IMAGE` pointed at it:
+Build and push the runtime image with both `latest` and a concrete version tag:
 
 ```powershell
-cd agent_management\hosted_agent_runtime
-docker build --platform linux/amd64 -t <your-acr>.azurecr.io/hosted-agent-runtime:v8 .
-docker push <your-acr>.azurecr.io/hosted-agent-runtime:v8
+cd agent_management
+.\deploy-hosted-runtime.ps1 -Tags latest,v8
 ```
+
+The script only pushes image tags. When an agent is redeployed from Agent Management, the backend resolves `hosted-agent-runtime:latest` in ACR, finds the matching concrete version tag, and deploys the hosted agent with that pinned tag. A later push to `latest` will not affect existing agents until they are redeployed.
 
 At deployment time, the project ID and Cosmos settings are passed to Foundry so the hosted agent loads its project definition directly from Azure Cosmos DB.
 
