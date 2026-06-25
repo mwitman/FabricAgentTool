@@ -6,7 +6,7 @@ from typing import Any
 
 from .models import AgentProject
 
-_VERSION_TAG_RE = re.compile(r"^v?\d+(?:[._-]\d+)*$", re.IGNORECASE)
+_VERSION_TAG_RE = re.compile(r"^(?:v?\d+(?:[._-]\d+)*|dt-\d{8}-\d{6})$", re.IGNORECASE)
 
 
 def _requires_fabric_item(source_type: str) -> bool:
@@ -200,7 +200,14 @@ def list_runtime_versions(image: str | None = None) -> dict[str, Any]:
     finally:
         credential.close()
 
-    tags = sorted(tags, key=_tag_sort_key, reverse=True)
+    tags = sorted(
+        tags,
+        key=lambda tag: (
+            1 if latest_digest and getattr(tag, "digest", None) == latest_digest else 0,
+            *_tag_sort_key(tag),
+        ),
+        reverse=True,
+    )
     return {
         "image_source": source_image,
         "repository": f"{parsed['registry']}/{parsed['repository']}",

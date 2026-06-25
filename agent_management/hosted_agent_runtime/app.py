@@ -90,8 +90,11 @@ try:
         _logging.getLogger().setLevel(_logging.INFO)
         _logging.getLogger("hosted_agent_runtime").setLevel(_logging.INFO)
         _logging.getLogger("hosted_agent_runtime.traces").setLevel(_logging.INFO)
+        _logging.getLogger("hosted_agent_runtime.dax").setLevel(_logging.INFO)
         _otel_handler = LoggingHandler(logger_provider=get_logger_provider())
+        _otel_handler.setLevel(_logging.INFO)
         _logging.getLogger().addHandler(_otel_handler)
+        _logging.getLogger("hosted_agent_runtime").info("App Insights telemetry configured for hosted runtime")
 except Exception:
     pass
 
@@ -1755,21 +1758,88 @@ async def _execute_dax_user_query(powerbi_token: str, workspace_id: str, semanti
 
 
 async def _execute_dax_user_queries(powerbi_token: str, workspace_id: str, semantic_model_id: str, dax_queries: list[dict[str, str]]) -> dict[str, Any]:
+    start = time.time()
+    query_count = len(dax_queries)
     use_arrow = os.environ.get("POWERBI_DAX_EXECUTION_MODE", "arrow").lower() == "arrow"
-    if use_arrow and arrow_ipc is not None:
-        arrow_result = await _execute_dax_arrow(powerbi_token, workspace_id, semantic_model_id, dax_queries)
-        if not arrow_result.get("errors") or os.environ.get("POWERBI_DAX_ARROW_FALLBACK_JSON", "true").lower() != "true":
-            return arrow_result
-    result_sets = []
-    dataset_url = f"{POWERBI_API}/groups/{workspace_id}/datasets/{semantic_model_id}"
-    async with aiohttp.ClientSession() as session:
-        for item in dax_queries:
-            payload = await _execute_dax(session, dataset_url, powerbi_token, item["query"])
-            if payload.get("errors"):
-                return {"endpoint": "executeQueries", "errors": payload["errors"], "result_sets": result_sets}
-            rows = _query_rows(payload)
-            result_sets.append({"name": item["name"], "query": item["query"], "row_count": len(rows), "rows": rows[:_max_dax_rows()]})
-    return {"endpoint": "executeQueries", "result_sets": result_sets}
+    _log_dax_trace(
+        "started",
+        workspace_id=workspace_id,
+        semantic_model_id=semantic_model_id,
+        query_count=query_count,
+        execution_mode="arrow" if use_arrow and arrow_ipc is not None else "json",
+        query_preview=_dax_query_preview(dax_queries),
+    )
+    with _dax_span(workspace_id, semantic_model_id, query_count):
+        try:
+            if use_arrow and arrow_ipc is not None:
+                arrow_result = await _execute_dax_arrow(powerbi_token, workspace_id, semantic_model_id, dax_queries)
+                if not arrow_result.get("errors") or os.environ.get("POWERBI_DAX_ARROW_FALLBACK_JSON", "true").lower() != "true":
+                    _log_dax_result("completed", workspace_id, semantic_model_id, arrow_result, query_count, start)
+                    return arrow_result
+            result_sets = []
+            dataset_url = f"{POWERBI_API}/groups/{workspace_id}/datasets/{semantic_model_id}"
+            async with aiohttp.ClientSession() as session:
+                for item in dax_queries:
+                    payload = await _execute_dax(session, dataset_url, powerbi_token, item["query"])
+                    if payload.get("errors"):
+                        result = {"endpoint": "executeQueries", "errors": payload["errors"], "result_sets": result_sets}
+                        _log_dax_result("failed", workspace_id, semantic_model_id, result, query_count, start)
+                        return result
+                    rows = _query_rows(payload)
+                    result_sets.append({"name": item["name"], "query": item["query"], "row_count": len(rows), "rows": rows[:_max_dax_rows()]})
+            result = {"endpoint": "executeQueries", "result_sets": result_sets}
+            _log_dax_result("completed", workspace_id, semantic_model_id, result, query_count, start)
+            return result
+        except Exception:
+            _log_dax_result("failed", workspace_id, semantic_model_id, {"errors": [{"message": "Unhandled DAX execution exception"}]}, query_count, start)
+            raise
+
+
+def _dax_query_preview(dax_queries: list[dict[str, str]], limit: int = 750) -> str:
+    preview = "\n\n".join(str(item.get("query") or "").strip() for item in dax_queries)
+    return preview[:limit] + "..." if len(preview) > limit else preview
+
+
+def _dax_row_count(result: dict[str, Any]) -> int:
+    return sum(int(item.get("row_count") or 0) for item in result.get("result_sets") or [] if isinstance(item, dict))
+
+
+def _log_dax_trace(event: str, **fields: Any) -> None:
+    logging.getLogger("hosted_agent_runtime.dax").info(
+        "DAX tool call %s: %s",
+        event,
+        " ".join(f"{key}={json.dumps(value, default=str)}" for key, value in fields.items()),
+    )
+
+
+def _log_dax_result(event: str, workspace_id: str, semantic_model_id: str, result: dict[str, Any], query_count: int, start: float) -> None:
+    _log_dax_trace(
+        event,
+        workspace_id=workspace_id,
+        semantic_model_id=semantic_model_id,
+        endpoint=result.get("endpoint", ""),
+        query_count=query_count,
+        row_count=_dax_row_count(result),
+        status="error" if result.get("errors") else "success",
+        elapsed_ms=round((time.time() - start) * 1000),
+        error_count=len(result.get("errors") or []),
+    )
+
+
+def _dax_span(workspace_id: str, semantic_model_id: str, query_count: int):
+    try:
+        from opentelemetry import trace
+        return trace.get_tracer("hosted_agent_runtime.dax").start_as_current_span(
+            "fabric.dax.execute",
+            attributes={
+                "fabric.workspace_id": workspace_id,
+                "fabric.semantic_model_id": semantic_model_id,
+                "fabric.dax.query_count": query_count,
+            },
+        )
+    except Exception:
+        from contextlib import nullcontext
+        return nullcontext()
 
 
 async def _execute_dax_arrow(powerbi_token: str, workspace_id: str, semantic_model_id: str, dax_queries: list[dict[str, str]]) -> dict[str, Any]:
