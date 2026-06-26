@@ -290,6 +290,96 @@ az deployment group what-if `
 
 Then deploy with `az deployment group create` after reviewing the what-if output.
 
+### Deploy Metadata Refresh Job To An Existing Container Apps Environment
+
+If Agent Management is deployed separately and the customer already has a Container Apps environment, create only the scheduled metadata refresh job. Use the same image as the Agent Management app and override the command to run the worker:
+
+```text
+python -m backend.metadata_refresh_worker
+```
+
+The job cron is a poller schedule. A value like `*/15 * * * *` wakes the job every 15 minutes to run any admin-managed metadata schedules whose `next_run_at` is due; it does not force every semantic model to refresh every 15 minutes.
+
+```powershell
+$resourceGroup = "<resource-group>"
+$environmentName = "<existing-container-apps-env>"
+$jobName = "agent-management-metadata-refresh"
+$image = "<acr-name>.azurecr.io/agent-management:<tag>"
+$acrName = "<acr-name>"
+$acrLoginServer = "$acrName.azurecr.io"
+
+$cosmosEndpoint = "https://<cosmos-account>.documents.azure.com:443/"
+$tenantId = "<tenant-id>"
+$appClientId = "<app-registration-client-id>"
+$appClientSecret = $env:APP_CLIENT_SECRET
+$pollerCron = "*/15 * * * *"
+
+az containerapp job create `
+  --name $jobName `
+  --resource-group $resourceGroup `
+  --environment $environmentName `
+  --trigger-type Schedule `
+  --cron-expression "$pollerCron" `
+  --replica-timeout 1800 `
+  --replica-retry-limit 1 `
+  --parallelism 1 `
+  --replica-completion-count 1 `
+  --image $image `
+  --command "python" `
+  --args "-m" "backend.metadata_refresh_worker" `
+  --mi-system-assigned `
+  --registry-server $acrLoginServer `
+  --registry-identity system `
+  --secrets app-client-secret="$appClientSecret" `
+  --env-vars `
+    AGENT_MGMT_COSMOS_ENDPOINT="$cosmosEndpoint" `
+    AGENT_MGMT_COSMOS_DATABASE="agents" `
+    AGENT_MGMT_COSMOS_CONTAINER="agentmetadata" `
+    AGENT_MGMT_COSMOS_PARTITION_KEY="/projectid" `
+    AGENT_MGMT_METADATA_CONTAINER="semanticmodelmetadata" `
+    AGENT_MGMT_METADATA_SCHEDULE_CONTAINER="metadatarefresh" `
+    AGENT_MGMT_COSMOS_AUTH_MODE="service_principal" `
+    AZURE_TENANT_ID="$tenantId" `
+    APP_CLIENT_ID="$appClientId" `
+    APP_CLIENT_SECRET="secretref:app-client-secret"
+```
+
+Grant the job identity permission to pull the image from ACR:
+
+```powershell
+$jobPrincipalId = az containerapp job show `
+  --name $jobName `
+  --resource-group $resourceGroup `
+  --query identity.principalId `
+  -o tsv
+
+$acrId = az acr show `
+  --name $acrName `
+  --resource-group $resourceGroup `
+  --query id `
+  -o tsv
+
+az role assignment create `
+  --assignee $jobPrincipalId `
+  --role AcrPull `
+  --scope $acrId
+```
+
+Start one execution manually to verify the worker can read schedules, refresh due metadata, and write run history:
+
+```powershell
+az containerapp job start `
+  --name $jobName `
+  --resource-group $resourceGroup
+
+az containerapp job execution list `
+  --name $jobName `
+  --resource-group $resourceGroup `
+  -o table
+```
+
+For managed identity authentication instead of an app client secret, set `AGENT_MGMT_COSMOS_AUTH_MODE="managed_identity"` and, when using a user-assigned identity, set `AZURE_CLIENT_ID` to that identity's client ID. The selected identity must have Cosmos data-plane access and Fabric access for `getDefinition` on the target workspaces and semantic models.
+
 ## Deployment Modes
 
 ### Standalone Agent

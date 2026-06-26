@@ -160,27 +160,35 @@ async function readApiResponse(response: Response) {
       payload = { error: text };
     }
   }
-  if (!response.ok || payload.error || payload.errors) {
-    const details = formatApiError(payload, response.status);
+  const hasPayloadErrors = Array.isArray(payload.errors) ? payload.errors.length > 0 : Boolean(payload.errors);
+  if (!response.ok || payload.error || hasPayloadErrors) {
+    const details = formatApiError(payload, response.status, response.statusText);
     const error = new Error(details);
     (error as any).payload = payload;
+    (error as any).status = response.status;
     throw error;
   }
   return payload;
 }
 
-function formatApiError(payload: any, status: number) {
-  if (payload?.error) return String(payload.error);
+function formatApiError(payload: any, status: number, statusText = "") {
+  const fallback = statusText ? `Request failed with status ${status} (${statusText})` : `Request failed with status ${status}`;
+  if (payload?.error) return formatMessage(payload.error) || fallback;
   if (Array.isArray(payload?.errors)) {
-    return payload.errors.map((error: any) => typeof error === "string" ? error : error?.message ? formatMessage(error.message) : formatMessage(error)).join("; ");
+    const details = payload.errors.map((error: any) => typeof error === "string" ? error : error?.message ? formatMessage(error.message) : formatMessage(error)).filter(Boolean).join("; ");
+    return details || fallback;
   }
-  return `Request failed with status ${status}`;
+  return fallback;
 }
 
 function formatMessage(value: any): string {
   if (typeof value === "string") return value;
   if (value?.message) return String(value.message);
-  return JSON.stringify(value, null, 2);
+  return JSON.stringify(value, null, 2) || "";
+}
+
+function formatCaughtError(error: any, fallback: string) {
+  return error?.message || error?.status && `Request failed with status ${error.status}` || fallback;
 }
 
 function cleanDeployment(deployment: any) {
@@ -647,7 +655,7 @@ export default function App() {
       setMetadataRuns(runsPayload.runs ?? []);
       setSemanticMetadata(metadataPayload.metadata ?? []);
     } catch (error: any) {
-      setStatus(`Metadata refresh data reload failed: ${error.message}`);
+      setStatus(`Metadata refresh data reload failed: ${formatCaughtError(error, "No error details returned by the API.")}`);
     } finally {
       setIsMetadataLoading(false);
     }
@@ -678,7 +686,7 @@ export default function App() {
       await loadMetadataAdmin();
       setStatus(`Metadata refresh ${payload.status ?? "completed"}: ${payload.models_refreshed ?? 0} refreshed, ${payload.models_failed ?? 0} failed.`);
     } catch (error: any) {
-      setStatus(`Metadata refresh request failed: ${error.message}`);
+      setStatus(`Metadata refresh request failed: ${formatCaughtError(error, "No error details returned by the API.")}`);
     } finally {
       setIsMetadataLoading(false);
     }

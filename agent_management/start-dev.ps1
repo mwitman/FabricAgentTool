@@ -21,7 +21,7 @@ if (-not (Test-Path (Join-Path $Frontend "node_modules"))) {
     Pop-Location
 }
 
-$BackendCommand = "Set-Location '$Root'; & '$Python' -m uvicorn backend.server:app --host 0.0.0.0 --port $BackendPort --reload"
+$BackendCommand = "Set-Location '$Root'; `$env:AGENT_MGMT_ENABLE_METADATA_SCHEDULER='true'; `$env:AGENT_MGMT_METADATA_SCHEDULER_INTERVAL_SECONDS='60'; & '$Python' -m uvicorn backend.server:app --host 0.0.0.0 --port $BackendPort --reload"
 $FrontendCommand = "Set-Location '$Frontend'; npm run dev -- --port $FrontendPort"
 
 Start-Process powershell -ArgumentList @("-NoExit", "-Command", $BackendCommand) -WindowStyle Normal

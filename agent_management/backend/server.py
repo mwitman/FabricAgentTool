@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 import os
 import re
 import uuid
@@ -22,7 +24,7 @@ from .models import AgentRoleBinding, BulkRuntimeDeploymentRequest, DeploymentRe
 from .permissions_store import create_permissions_store
 from .project_store import create_project_store, get_version_store
 from .prompt_generator import dev_chat, generate_prompt
-from .semantic_metadata import MetadataScheduleStore, SemanticMetadataStore, refresh_all_project_metadata, refresh_project_metadata
+from .semantic_metadata import MetadataScheduleStore, SemanticMetadataStore, refresh_all_project_metadata, refresh_project_metadata, run_due_schedules
 
 ROOT = Path(__file__).resolve().parent
 APP_ROOT = ROOT.parent
@@ -40,6 +42,45 @@ app.add_middleware(
 store = None
 _permissions_store = None
 _dev_history: dict[str, list[dict[str, str]]] = {}
+_metadata_scheduler_task: asyncio.Task | None = None
+
+
+def _metadata_scheduler_enabled() -> bool:
+    return os.environ.get("AGENT_MGMT_ENABLE_METADATA_SCHEDULER", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _metadata_scheduler_interval_seconds() -> int:
+    try:
+        return max(10, int(os.environ.get("AGENT_MGMT_METADATA_SCHEDULER_INTERVAL_SECONDS", "60")))
+    except ValueError:
+        return 60
+
+
+async def _metadata_scheduler_loop() -> None:
+    interval = _metadata_scheduler_interval_seconds()
+    while True:
+        try:
+            await run_due_schedules()
+        except Exception as exc:
+            print(f"Metadata refresh scheduler failed: {exc}", flush=True)
+        await asyncio.sleep(interval)
+
+
+@app.on_event("startup")
+async def start_metadata_scheduler() -> None:
+    global _metadata_scheduler_task
+    if _metadata_scheduler_enabled() and _metadata_scheduler_task is None:
+        _metadata_scheduler_task = asyncio.create_task(_metadata_scheduler_loop())
+
+
+@app.on_event("shutdown")
+async def stop_metadata_scheduler() -> None:
+    global _metadata_scheduler_task
+    if _metadata_scheduler_task is not None:
+        _metadata_scheduler_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _metadata_scheduler_task
+        _metadata_scheduler_task = None
 
 
 def _store():
