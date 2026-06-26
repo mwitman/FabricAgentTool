@@ -87,11 +87,7 @@ async def generate_prompt(request: PromptGenerationRequest) -> dict[str, str]:
     project = request.project
     system = "You generate concise, production-ready Microsoft Foundry hosted-agent prompts for Fabric semantic model agents."
     user = _prompt_request_text(project, request)
-    response = await _client().responses.create(
-        model=os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"],
-        input=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-    )
-    content = response.output_text or ""
+    content = await _chat_completion_text([{"role": "system", "content": system}, {"role": "user", "content": user}])
     return {"prompt": content.strip()}
 
 
@@ -146,15 +142,9 @@ async def dev_chat(
         )
 
     system = _dev_system_prompt(project, selected_agent, selected_model, metadata, query_result)
-    messages = [{"role": "system", "content": system}]
-    messages.extend(history[-12:])
-    messages.append({"role": "user", "content": message})
+    messages = [{"role": "system", "content": system}, *_chat_history_messages(history[-12:]), {"role": "user", "content": message}]
     trace.append({"step": "prompt", "status": "complete", "detail": "Built the agent prompt with project configuration and available semantic metadata."})
-    response = await _client().responses.create(
-        model=os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"],
-        input=messages,
-    )
-    answer = response.output_text or ""
+    answer = await _chat_completion_text(messages)
     trace.append({"step": "model", "status": "complete", "detail": "Foundry model returned the Dev UI response."})
     return {
         "response": answer.strip(),
@@ -165,6 +155,26 @@ async def dev_chat(
             "trace": trace,
         },
     }
+
+
+async def _chat_completion_text(messages: list[dict[str, str]]) -> str:
+    response = await _client().chat.completions.create(
+        model=os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"],
+        messages=messages,
+    )
+    if not response.choices:
+        return ""
+    return response.choices[0].message.content or ""
+
+
+def _chat_history_messages(history: list[dict[str, str]]) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    for item in history:
+        role = str(item.get("role") or "user").strip().lower()
+        content = str(item.get("content") or "").strip()
+        if role in {"user", "assistant"} and content:
+            messages.append({"role": role, "content": content})
+    return messages
 
 
 def _resolve_external_agent_details(project: AgentProject) -> str:

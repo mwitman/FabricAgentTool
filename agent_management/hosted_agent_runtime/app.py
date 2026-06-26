@@ -2439,16 +2439,123 @@ def _ai_instructions_from_parts(parts: list[dict[str, Any]]) -> str:
             text = _decode_definition_payload(part)
             if text:
                 return text
-    # Also check model.tmdl for __PBI_AIInstructions annotation
+    # Also check TMDL annotations for AI instructions.
     for part in parts:
-        path = str(part.get("path") or "")
-        if path.endswith("model.tmdl") or path == "model.tmdl":
-            text = _decode_definition_payload(part)
-            if text:
-                match = re.search(r"annotation\s+__PBI_AIInstructions\s*=\s*```(.*?)```", text, re.DOTALL)
-                if match:
-                    return match.group(1).strip()
+        text = _decode_definition_payload(part)
+        instructions = _ai_instructions_from_tmdl(text)
+        if instructions:
+            return instructions
     return ""
+
+
+def _ai_instructions_from_tmdl(text: str) -> str:
+    if not text:
+        return ""
+    linguistic_instructions = _ai_instructions_from_linguistic_metadata(text)
+    if linguistic_instructions:
+        return linguistic_instructions
+    name_pattern = r"(?:__PBI_AIInstructions|PBI_AIInstructions|AIInstructions|aiInstructions)"
+    annotation_pattern = re.compile(
+        rf"^\s*annotation\s+['\"]?{name_pattern}['\"]?\s*=\s*(.*?)(?=^\s*annotation\s+|^\s*(?:table|relationship|culture|role)\s+|\Z)",
+        re.DOTALL | re.IGNORECASE | re.MULTILINE,
+    )
+    for match in annotation_pattern.finditer(text):
+        value = _clean_tmdl_annotation_value(match.group(1))
+        if value:
+            return value
+    return ""
+
+
+def _ai_instructions_from_linguistic_metadata(text: str) -> str:
+    for match in re.finditer(r"\blinguisticMetadata\s*=", text, re.IGNORECASE):
+        start = text.find("{", match.end())
+        metadata_json = _extract_json_object(text, start)
+        if not metadata_json:
+            continue
+        try:
+            metadata = json.loads(metadata_json)
+        except json.JSONDecodeError:
+            instructions = _custom_instructions_from_jsonish(metadata_json)
+            if instructions:
+                return instructions.strip()
+            continue
+        instructions = _find_json_string(metadata, "CustomInstructions")
+        if instructions:
+            return instructions.strip()
+    return ""
+
+
+def _custom_instructions_from_jsonish(value: str) -> str:
+    match = re.search(r'"CustomInstructions"\s*:\s*"((?:\\.|[^"\\])*)"', value, re.DOTALL | re.IGNORECASE)
+    if not match:
+        return ""
+    raw_value = match.group(1)
+    for candidate in (raw_value, raw_value.replace("\r\n", "\\n").replace("\n", "\\n")):
+        try:
+            return str(json.loads(f'"{candidate}"'))
+        except json.JSONDecodeError:
+            pass
+    return raw_value.replace("\\r\\n", "\n").replace("\\n", "\n").strip()
+
+
+def _extract_json_object(text: str, start: int) -> str:
+    if start < 0 or start >= len(text) or text[start] != "{":
+        return ""
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:index + 1]
+    return ""
+
+
+def _find_json_string(value: Any, key: str) -> str:
+    if isinstance(value, dict):
+        for item_key, item_value in value.items():
+            if str(item_key).lower() == key.lower() and isinstance(item_value, str):
+                return item_value
+            nested = _find_json_string(item_value, key)
+            if nested:
+                return nested
+    elif isinstance(value, list):
+        for item in value:
+            nested = _find_json_string(item, key)
+            if nested:
+                return nested
+    return ""
+
+
+def _clean_tmdl_annotation_value(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    if value.startswith("```"):
+        value = value[3:]
+        if value.endswith("```"):
+            value = value[:-3]
+        return value.strip()
+    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+        try:
+            return str(json.loads(value)).strip()
+        except json.JSONDecodeError:
+            return value[1:-1].strip()
+    return value.strip()
 
 
 def _clean_tmdl_name(value: str) -> str:

@@ -1,5 +1,5 @@
 param(
-    [int]$BackendPort = 8092,
+    [int]$BackendPort = 8094,
     [int]$FrontendPort = 5173
 )
 
@@ -22,7 +22,7 @@ if (-not (Test-Path (Join-Path $Frontend "node_modules"))) {
 }
 
 $BackendCommand = "Set-Location '$Root'; `$env:AGENT_MGMT_ENABLE_METADATA_SCHEDULER='true'; `$env:AGENT_MGMT_METADATA_SCHEDULER_INTERVAL_SECONDS='60'; & '$Python' -m uvicorn backend.server:app --host 0.0.0.0 --port $BackendPort --reload"
-$FrontendCommand = "Set-Location '$Frontend'; npm run dev -- --port $FrontendPort"
+$FrontendCommand = "Set-Location '$Frontend'; `$env:VITE_BACKEND_URL='http://localhost:$BackendPort'; npm run dev -- --port $FrontendPort"
 
 Start-Process powershell -ArgumentList @("-NoExit", "-Command", $BackendCommand) -WindowStyle Normal
 Start-Process powershell -ArgumentList @("-NoExit", "-Command", $FrontendCommand) -WindowStyle Normal
