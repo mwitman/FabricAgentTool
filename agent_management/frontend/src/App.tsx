@@ -647,7 +647,7 @@ export default function App() {
       setMetadataRuns(runsPayload.runs ?? []);
       setSemanticMetadata(metadataPayload.metadata ?? []);
     } catch (error: any) {
-      setStatus(`Metadata refresh load failed: ${error.message}`);
+      setStatus(`Metadata refresh data reload failed: ${error.message}`);
     } finally {
       setIsMetadataLoading(false);
     }
@@ -678,7 +678,7 @@ export default function App() {
       await loadMetadataAdmin();
       setStatus(`Metadata refresh ${payload.status ?? "completed"}: ${payload.models_refreshed ?? 0} refreshed, ${payload.models_failed ?? 0} failed.`);
     } catch (error: any) {
-      setStatus(`Metadata refresh failed: ${error.message}`);
+      setStatus(`Metadata refresh request failed: ${error.message}`);
     } finally {
       setIsMetadataLoading(false);
     }
