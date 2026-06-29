@@ -207,6 +207,7 @@ def _agent_environment() -> dict[str, str]:
         "APP_CLIENT_ID",
         "APP_CLIENT_SECRET",
         "FABRIC_CORE_MCP_ENDPOINT",
+        "FABRIC_AGENT_DEBUG_TELEMETRY",
     ]
     environment = {name: os.environ[name] for name in names if os.environ.get(name)}
     aliases = {

@@ -72,6 +72,17 @@ except ImportError:
 
 load_dotenv()
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_telemetry_enabled() -> bool:
+    return _env_flag("FABRIC_AGENT_DEBUG_TELEMETRY", False)
+
 # ── Observability / Tracing ───────────────────────────────────────────────────
 _appinsights_conn = os.environ.get("FABRIC_AGENT_APPINSIGHTS_CONNECTION_STRING") or os.environ.get("APPLICATIONINSIGHTS_CONNECTION_STRING", "")
 try:
@@ -84,7 +95,7 @@ try:
         additional_exporters.append(AzureMonitorLogExporter(connection_string=_appinsights_conn))
         additional_exporters.append(AzureMonitorMetricExporter(connection_string=_appinsights_conn))
 
-    OBSERVABILITY_SETTINGS.enable_sensitive_data = True
+    OBSERVABILITY_SETTINGS.enable_sensitive_data = _debug_telemetry_enabled()
     OBSERVABILITY_SETTINGS._configure(additional_exporters=additional_exporters if additional_exporters else None)
 
     # Also attach the OTel log handler to the root logger so all app logs go to traces table
@@ -99,7 +110,10 @@ try:
         _otel_handler = LoggingHandler(logger_provider=get_logger_provider())
         _otel_handler.setLevel(_logging.INFO)
         _logging.getLogger().addHandler(_otel_handler)
-        _logging.getLogger("hosted_agent_runtime").info("App Insights telemetry configured for hosted runtime")
+        _logging.getLogger("hosted_agent_runtime").info(
+            "App Insights telemetry configured for hosted runtime debug_telemetry=%s",
+            _debug_telemetry_enabled(),
+        )
 except Exception:
     pass
 
@@ -1715,22 +1729,33 @@ def _make_tool_trace_wrapper(conversation_id: str):
         async def _traced_invoke(*args, **kwargs):
             tool_args = _tool_arguments(kwargs)
             start = time.time()
-            logger.info(
-                "LLM tool call started: conversation_id=%s tool=%s args=%s",
-                conversation_id,
-                tool_name,
-                json.dumps(tool_args, default=str)[:1000],
-            )
+            if _debug_telemetry_enabled():
+                logger.info(
+                    "LLM tool call started: conversation_id=%s tool=%s args=%s",
+                    conversation_id,
+                    tool_name,
+                    json.dumps(tool_args, default=str)[:1000],
+                )
+            else:
+                logger.info("LLM tool call started: conversation_id=%s tool=%s", conversation_id, tool_name)
             try:
                 result = await original_invoke(*args, **kwargs)
                 elapsed_ms = round((time.time() - start) * 1000)
-                logger.info(
-                    "LLM tool call completed: conversation_id=%s tool=%s status=success elapsed_ms=%s result_preview=%s",
-                    conversation_id,
-                    tool_name,
-                    elapsed_ms,
-                    _tool_result_preview(result),
-                )
+                if _debug_telemetry_enabled():
+                    logger.info(
+                        "LLM tool call completed: conversation_id=%s tool=%s status=success elapsed_ms=%s result_preview=%s",
+                        conversation_id,
+                        tool_name,
+                        elapsed_ms,
+                        _tool_result_preview(result),
+                    )
+                else:
+                    logger.info(
+                        "LLM tool call completed: conversation_id=%s tool=%s status=success elapsed_ms=%s",
+                        conversation_id,
+                        tool_name,
+                        elapsed_ms,
+                    )
                 return result
             except Exception as exc:
                 elapsed_ms = round((time.time() - start) * 1000)
@@ -2110,7 +2135,7 @@ async def _execute_dax_user_queries(powerbi_token: str, workspace_id: str, seman
         semantic_model_id=semantic_model_id,
         query_count=query_count,
         execution_mode="arrow" if use_arrow and arrow_ipc is not None else "json",
-        query_preview=_dax_query_preview(dax_queries),
+        **({"query_preview": _dax_query_preview(dax_queries)} if _debug_telemetry_enabled() else {}),
     )
     with _dax_span(workspace_id, semantic_model_id, query_count):
         try:

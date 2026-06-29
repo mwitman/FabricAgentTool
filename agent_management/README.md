@@ -107,6 +107,8 @@ The runtime also exposes generic `call_fabric_mcp` and `call_fabric_mcp_tool` to
 
 Set `APPLICATIONINSIGHTS_CONNECTION_STRING` or `FABRIC_AGENT_APPINSIGHTS_CONNECTION_STRING` so hosted runtime logs and OpenTelemetry spans are exported to Application Insights. Foundry hosted agents reject `APPLICATIONINSIGHTS_CONNECTION_STRING` as a reserved variable, so Agent Management maps it to `FABRIC_AGENT_APPINSIGHTS_CONNECTION_STRING` for the hosted runtime.
 
+Set `FABRIC_AGENT_DEBUG_TELEMETRY=false` for normal production operation. With the default `false` value, hosted runtime logs keep timings, statuses, counts, and failures, but omit verbose payload-like fields such as tool arguments, tool result previews, DAX query previews, and sensitive agent framework telemetry. Temporarily set `FABRIC_AGENT_DEBUG_TELEMETRY=true` while debugging to restore the richer App Insights logging shape.
+
 After changing hosted runtime telemetry code, rebuild and push the runtime image, then redeploy the hosted agent to the new concrete runtime tag. Existing hosted agents stay pinned to their previously deployed runtime version.
 
 ### DAX Tool Call Logs
