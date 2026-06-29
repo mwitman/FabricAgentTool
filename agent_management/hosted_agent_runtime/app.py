@@ -368,7 +368,8 @@ def _build_instructions(project: dict[str, Any]) -> str:
             f"You are {agent.get('name', 'a Fabric semantic model agent')}. "
             f"{agent.get('description', '')} "
             f"You answer questions using {model_name}. "
-            "For any question that asks about data, fields, entities, measures, identity resolution, filtering, counts, totals, trends, or records, call get_semantic_model_metadata first and then call execute_dax_query or execute_dax_queries before answering. "
+            "For any question that asks about data, fields, entities, measures, identity resolution, filtering, counts, totals, trends, or records, use cached semantic metadata from get_semantic_model_metadata and then call execute_dax_query or execute_dax_queries before answering. "
+            "If cached metadata is unavailable, report that an admin must refresh semantic metadata for this model. "
             "Do not answer with a plan or say you are going to get metadata; call the tool instead. "
             "Answer from tool results, and say what failed if a required tool call fails."
         )
@@ -514,7 +515,8 @@ def _with_runtime_tool_policy(prompt: str, configured_sources: list[dict[str, An
     ]
     if semantic_sources:
         policy.extend([
-            "For semantic-model questions about data, fields, entities, measures, identity resolution, filtering, counts, totals, trends, records, or DAX, call get_semantic_model_metadata before answering.",
+            "For semantic-model questions about data, fields, entities, measures, identity resolution, filtering, counts, totals, trends, records, or DAX, call get_semantic_model_metadata to read cached metadata before answering.",
+            "Runtime semantic metadata comes from the service-principal-populated Cosmos cache. If cached metadata is unavailable, report that an admin must refresh semantic metadata; do not use user credentials to discover schema.",
             "For data-backed answers, call execute_dax_query or execute_dax_queries after metadata is available; do not answer from assumptions or prompt text alone.",
             "When an answer needs multiple independent result sets, comparisons, validations, breakdowns, totals plus details, or more than one EVALUATE statement, prefer execute_dax_queries and pass all queries in dax_queries_json so they can run in one semantic-model operation.",
             "Do not respond with a plan before calling required tools; make the tool call in the same turn instead.",
@@ -1272,7 +1274,7 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
 
     @ai_function(
         name="get_semantic_model_metadata",
-        description="Required first step for semantic-model questions. Get table, column, measure, relationship, and AI instruction metadata for a Fabric semantic model before answering or writing DAX.",
+        description="Required first step for semantic-model questions. Read cached table, column, measure, relationship, and AI instruction metadata for a configured Fabric semantic model before answering or writing DAX.",
     )
     async def get_semantic_model_metadata(workspace_id: str, semantic_model_id: str) -> str:
         if not _can_query_semantic_model(workspace_id, semantic_model_id):
@@ -1280,47 +1282,16 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
         cached_metadata = _semantic_metadata_from_cache(workspace_id, semantic_model_id)
         if cached_metadata and cached_metadata.get("tables", {}).get("value"):
             return json.dumps(cached_metadata, indent=2)
-        dataset_url = f"{POWERBI_API}/groups/{workspace_id}/datasets/{semantic_model_id}"
-        async with aiohttp.ClientSession() as session:
-            # Primary: DAX INFO queries (requires only Build permission, no special item permissions)
-            tables = await _semantic_model_tables_from_dax(session, dataset_url, effective_powerbi_token)
-            if not tables.get("errors") and tables.get("value"):
-                return json.dumps({"workspace_id": workspace_id, "semantic_model_id": semantic_model_id, "tables": tables}, indent=2)
-
-            dax_errors = tables.get("errors", [])
-
-            # Fallback: getDefinition (optional, may require higher item permissions)
-            definition_result: dict[str, Any] = {}
-            definition_errors: list[dict[str, Any]] = []
-            try:
-                definition_result = await _semantic_model_tables_from_fabric_definition(session, workspace_id, semantic_model_id, fabric_token)
-                if not definition_result.get("errors") and definition_result.get("value"):
-                    result: dict[str, Any] = {"workspace_id": workspace_id, "semantic_model_id": semantic_model_id, "tables": definition_result}
-                    if definition_result.get("relationships"):
-                        result["relationships"] = definition_result.pop("relationships")
-                    if definition_result.get("ai_instructions"):
-                        result["ai_instructions"] = definition_result.pop("ai_instructions")
-                    return json.dumps(result, indent=2)
-                definition_errors = definition_result.get("errors", [])
-            except Exception as e:
-                logging.getLogger("hosted_agent_runtime").debug(f"getDefinition failed (optional): {e}")
-                definition_errors = [{"message": str(e)}]
-
-            # Last resort: REST /tables endpoint
-            tables = await _get_json(session, f"{dataset_url}/tables", _powerbi_headers(effective_powerbi_token))
-            if tables.get("value"):
-                return json.dumps({"workspace_id": workspace_id, "semantic_model_id": semantic_model_id, "tables": tables}, indent=2)
-
-            # All methods failed; return diagnostics
-            diagnostics: list[dict[str, Any]] = []
-            if dax_errors:
-                diagnostics.append({"source": "executeQueries_DAX", "errors": dax_errors})
-            if definition_errors:
-                diagnostics.append({"source": "getDefinition", "errors": definition_errors})
-            if tables.get("error") or tables.get("errors"):
-                diagnostics.append({"source": "REST_tables", "errors": tables.get("errors") or [tables.get("error")]})
-            tables["_diagnostics"] = diagnostics
-            return json.dumps({"workspace_id": workspace_id, "semantic_model_id": semantic_model_id, "tables": tables}, indent=2)
+        return json.dumps(
+            {
+                "error": "Semantic metadata is not available in the runtime cache. Ask an admin to refresh semantic metadata for this semantic model before querying it.",
+                "workspace_id": workspace_id,
+                "semantic_model_id": semantic_model_id,
+                "metadata_source": "cosmos_cache",
+                "requires_admin_refresh": True,
+            },
+            indent=2,
+        )
 
     @ai_function(
         name="execute_dax_query",
@@ -1375,8 +1346,6 @@ def _create_agent(project: dict[str, Any], fabric_token: str, powerbi_token: str
         tools.extend([list_configured_semantic_models, get_semantic_model_metadata, execute_dax_query, execute_dax_queries])
     if graphql_sources or allow_dynamic_fabric_items:
         tools.extend([query_fabric_graphql, get_fabric_item_definition])
-    elif data_sources:
-        tools.append(get_fabric_item_definition)
     if sql_sources or allow_dynamic_fabric_items:
         tools.append(execute_fabric_sql_query)
     if data_agent_sources or allow_dynamic_fabric_items:

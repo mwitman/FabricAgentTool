@@ -37,9 +37,9 @@ Copy-Item frontend\env.TEMPLATE frontend\.env
 .\start-dev.ps1
 ```
 
-Open `http://localhost:5173` while developing the frontend. Vite proxies `/api` requests to the FastAPI backend on `http://localhost:8091`, so React changes hot-reload without running `npm run build`.
+Open `http://localhost:5173` while developing the frontend. Vite proxies `/api` requests to the FastAPI backend on `http://localhost:8094`, so React changes hot-reload without running `npm run build`.
 
-Use `npm run build` only when you want to refresh the production-style static bundle served directly by FastAPI on `http://localhost:8091`.
+Use `npm run build` only when you want to refresh the production-style static bundle served directly by FastAPI on `http://localhost:8094`.
 
 ## Container Build
 
@@ -83,6 +83,10 @@ The signed-in user's delegated Fabric token is used for the data-source dropdown
 
 The service principal is used for backend operations: Cosmos DB stores, Foundry management, runtime-version reads from ACR, and semantic metadata refresh with Fabric `getDefinition`. The service principal must be allowed to use Fabric APIs by tenant settings and must also have access to the workspaces/items being refreshed.
 
+Hosted semantic-model agents use a least-privilege runtime path. Runtime schema, relationship, and AI-instruction metadata is read from the service-principal-populated Cosmos cache. The user's delegated credentials are still used for data access through guarded DAX `executeQueries`, but the hosted runtime does not use the user's token to run semantic-model `getDefinition`, DAX INFO schema discovery, Power BI `/tables`, or workspace/item enumeration for configured semantic-model projects. This lets runtime users avoid workspace Viewer access when the metadata cache is populated; they still need the semantic-model permissions required by Power BI `executeQueries`, typically Build/read access on the semantic model.
+
+Authoring is separate from runtime. Users who select data sources in Agent Management still need enough Fabric access for the data-source dropdown to enumerate visible workspaces/items. Fabric MCP projects can also expose dynamic workspace/item discovery at runtime because that is the purpose of the Fabric MCP source type.
+
 ## Semantic Metadata Refresh
 
 Semantic model metadata is cached in Cosmos DB using the `AGENT_MGMT_METADATA_CONTAINER` container, defaulting to `semanticmodelmetadata`. Refresh runs and schedules use `AGENT_MGMT_METADATA_SCHEDULE_CONTAINER`, defaulting to `metadatarefresh`.
@@ -90,6 +94,8 @@ Semantic model metadata is cached in Cosmos DB using the `AGENT_MGMT_METADATA_CO
 The Metadata menu's **Run now** button calls `/api/admin/metadata-refresh/run-now`. It scans all saved projects, extracts configured semantic model sources, deduplicates them by `workspace_id:semantic_model_id`, and refreshes each model by calling Fabric `getDefinition?format=TMDL` with the service principal. The refresh writes normalized tables, columns, measures, relationships, and AI instructions to the shared metadata cache.
 
 Deploying to Foundry also refreshes semantic metadata for the project being deployed before the hosted-agent version is submitted. The metadata is written to the shared cache, not embedded into the project version snapshot. Existing deployed agents can see later cache refreshes because the hosted runtime reads from the shared metadata cache container.
+
+At runtime, `get_semantic_model_metadata` is cache-only. If the cache entry is missing or does not contain table metadata, the hosted agent returns a refresh-required error instead of using the user's token for DAX INFO queries, Power BI `/tables`, or Fabric `getDefinition`. Admins should run metadata refresh before deploying or testing semantic-model agents.
 
 ## SQL Endpoint Behavior
 
