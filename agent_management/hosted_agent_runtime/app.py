@@ -1719,6 +1719,14 @@ def _tool_result_preview(result: Any, limit: int = 1000) -> str:
     return result_str[:limit] + "..." if len(result_str) > limit else result_str
 
 
+def _powerbi_dataset_url(workspace_id: str, semantic_model_id: str) -> str:
+    return f"{POWERBI_API}/datasets/{semantic_model_id}"
+
+
+def _powerbi_dax_queries_url(workspace_id: str, semantic_model_id: str) -> str:
+    return f"{_powerbi_dataset_url(workspace_id, semantic_model_id)}/executeDaxQueries"
+
+
 def _make_tool_trace_wrapper(conversation_id: str):
     logger = logging.getLogger("hosted_agent_runtime.traces")
 
@@ -2135,6 +2143,7 @@ async def _execute_dax_user_queries(powerbi_token: str, workspace_id: str, seman
         semantic_model_id=semantic_model_id,
         query_count=query_count,
         execution_mode="arrow" if use_arrow and arrow_ipc is not None else "json",
+        endpoint_scope="dataset",
         **({"query_preview": _dax_query_preview(dax_queries)} if _debug_telemetry_enabled() else {}),
     )
     with _dax_span(workspace_id, semantic_model_id, query_count):
@@ -2145,7 +2154,7 @@ async def _execute_dax_user_queries(powerbi_token: str, workspace_id: str, seman
                     _log_dax_result("completed", workspace_id, semantic_model_id, arrow_result, query_count, start)
                     return arrow_result
             result_sets = []
-            dataset_url = f"{POWERBI_API}/groups/{workspace_id}/datasets/{semantic_model_id}"
+            dataset_url = _powerbi_dataset_url(workspace_id, semantic_model_id)
             async with aiohttp.ClientSession() as session:
                 for item in dax_queries:
                     payload = await _execute_dax(session, dataset_url, powerbi_token, item["query"])
@@ -2212,7 +2221,7 @@ def _dax_span(workspace_id: str, semantic_model_id: str, query_count: int):
 
 async def _execute_dax_arrow(powerbi_token: str, workspace_id: str, semantic_model_id: str, dax_queries: list[dict[str, str]]) -> dict[str, Any]:
     dax_script = "\n\n".join(item["query"].strip() for item in dax_queries)
-    url = f"{POWERBI_API}/groups/{workspace_id}/datasets/{semantic_model_id}/executeDaxQueries"
+    url = _powerbi_dax_queries_url(workspace_id, semantic_model_id)
     body = {"query": dax_script}
     headers = {**_powerbi_headers(powerbi_token), "Accept": "application/vnd.apache.arrow.stream"}
     async with aiohttp.ClientSession() as session:

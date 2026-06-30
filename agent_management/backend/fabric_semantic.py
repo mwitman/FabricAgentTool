@@ -158,7 +158,7 @@ async def semantic_model_metadata(powerbi_token: str, workspace_id: str, model_i
         }
         tables_errors = metadata.get("tables", {}).get("errors") or []
         if any("not Push API dataset" in json.dumps(error) for error in tables_errors):
-            metadata["tables"] = await _semantic_model_tables_from_dax(session, dataset_url, powerbi_token)
+            metadata["tables"] = await _semantic_model_tables_from_dax(session, f"{POWERBI_API}/datasets/{model_id}", powerbi_token)
         if fabric_token and metadata.get("tables", {}).get("errors"):
             definition_tables = await _semantic_model_tables_from_fabric_definition(session, workspace_id, model_id, fabric_token)
             if definition_tables.get("value") or definition_tables.get("errors"):
@@ -169,7 +169,7 @@ async def semantic_model_metadata(powerbi_token: str, workspace_id: str, model_i
 async def execute_readonly_dax(powerbi_token: str, workspace_id: str, model_id: str, query: str) -> dict[str, Any]:
     if not _is_readonly_dax(query):
         return {"errors": [{"message": "Only read-only DAX queries that start with EVALUATE are allowed."}], "query": query}
-    dataset_url = f"{POWERBI_API}/groups/{workspace_id}/datasets/{model_id}"
+    dataset_url = f"{POWERBI_API}/datasets/{model_id}"
     async with aiohttp.ClientSession() as session:
         payload = await _execute_dax(session, dataset_url, powerbi_token, query)
     if payload.get("errors"):
