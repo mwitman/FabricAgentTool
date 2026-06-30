@@ -2153,6 +2153,17 @@ async def _execute_dax_user_queries(powerbi_token: str, workspace_id: str, seman
                 if not arrow_result.get("errors") or os.environ.get("POWERBI_DAX_ARROW_FALLBACK_JSON", "true").lower() != "true":
                     _log_dax_result("completed", workspace_id, semantic_model_id, arrow_result, query_count, start)
                     return arrow_result
+                _log_dax_trace(
+                    "arrow_fallback",
+                    workspace_id=workspace_id,
+                    semantic_model_id=semantic_model_id,
+                    endpoint=arrow_result.get("endpoint", "executeDaxQueries"),
+                    fallback_endpoint="executeQueries",
+                    query_count=query_count,
+                    status="error",
+                    elapsed_ms=round((time.time() - start) * 1000),
+                    error_count=len(arrow_result.get("errors") or []),
+                )
             result_sets = []
             dataset_url = _powerbi_dataset_url(workspace_id, semantic_model_id)
             async with aiohttp.ClientSession() as session:
